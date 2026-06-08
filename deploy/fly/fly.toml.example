@@ -1,0 +1,32 @@
+app = "rsdb-aggregate"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RSDB_AGGREGATE_HOST = "0.0.0.0"
+  RSDB_AGGREGATE_PORT = "8080"
+  RSDB_AGGREGATE_DATA_DIR = "/data/aggregate"
+  RSDB_AGGREGATE_RETENTION_HOURS = "72"
+  RSDB_AGGREGATE_HOT_MAX_MB = "250"
+  # Public Ed25519 receiver keys allowed to submit to this aggregate.
+  RSDB_ALLOWLIST = ''''''
+
+[[mounts]]
+  source = "rsdb_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/status.json"

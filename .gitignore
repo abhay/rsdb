@@ -1,0 +1,9 @@
+/target/
+node_modules/
+/web/dist/
+.env
+/pi/.env
+/pi/backups/
+/pi/images/
+/pi/secrets/
+.DS_Store

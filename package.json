@@ -1,0 +1,17 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:web": "bun build web/src/main.jsx --target browser --outfile web/dist/app.js",
+    "check": "scripts/check.sh",
+    "check:fast": "scripts/check-fast.sh",
+    "check:web": "node scripts/check-web-bundle.mjs && node --check web/dist/app.js",
+    "hooks:install": "lefthook install"
+  },
+  "dependencies": {
+    "preact": "^10.29.2"
+  },
+  "devDependencies": {
+    "lefthook": "^2.1.8"
+  }
+}

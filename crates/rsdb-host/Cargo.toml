@@ -1,0 +1,21 @@
+[package]
+name = "rsdb-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RSDB host data model, signing, feed, and aggregate services"
+
+[lib]
+name = "rsdb"
+path = "src/lib.rs"
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+rsdb-core = { version = "0.1.0", path = "../rsdb-core", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+pre-commit:
+  commands:
+    fast-check:
+      run: bun run check:fast
+
+pre-push:
+  commands:
+    full-check:
+      run: bun run check

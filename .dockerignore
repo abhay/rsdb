@@ -1,0 +1,10 @@
+.git
+.env
+.commit-msg
+target
+node_modules
+web/dist
+pi/backups
+pi/images
+pi/secrets
+.DS_Store
