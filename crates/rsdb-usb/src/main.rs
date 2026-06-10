@@ -2378,6 +2378,7 @@ mod websocket {
                     mut stats,
                     ..
                 } => {
+                    stats.receiver_site.clone_from(&self.receiver_site);
                     stats.websocket_clients = self.websocket_clients();
                     stats.submission = self.submission_status().health();
                     FeedMessage::heartbeat_for_protocol(protocol, now_ms, aircraft_count, stats)
@@ -2524,6 +2525,7 @@ mod websocket {
 
             FeedStats {
                 uptime_ms,
+                receiver_site: self.receiver_site.clone(),
                 receiver_connected: status.receiver_connected,
                 last_frame_ms: status.last_frame_ms,
                 last_usb_chunk_ms: status.last_usb_chunk_ms,

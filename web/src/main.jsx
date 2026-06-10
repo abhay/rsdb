@@ -1,5 +1,6 @@
 import { render } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
+import maplibregl from "maplibre-gl";
 
 const TRAIL_MAX_POINTS = 180;
 const TRAIL_MAX_AGE_MS = 30 * 60 * 1000;
@@ -11,6 +12,9 @@ const EARTH_RADIUS_KM = 6371;
 const FIELD_RECENT_MS = 30 * 1000;
 const FIELD_STALE_MS = 2 * 60 * 1000;
 const RECEIVER_COLORS = ["#70d673", "#7fdcff", "#f7cb6f", "#e88a74", "#a78bfa", "#4cc8a3", "#f78fb3"];
+const MAP_STYLE_URL = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
+const MAP_READY_TIMEOUT_MS = 6000;
+const DEFAULT_CENTER = { lat: 0, lon: 0 };
 
 const EMPTY_STATUS = {
   receiver_connected: false,
@@ -36,11 +40,6 @@ const FILTERS = [
   ["moving", "Moving"],
 ];
 
-const VIEW_MODES = [
-  ["radar", "Radar"],
-  ["map", "Map"],
-];
-
 const RANGE_OPTIONS = [
   ["auto", "Auto"],
   [10, "10"],
@@ -51,15 +50,11 @@ const RANGE_OPTIONS = [
 
 const AIRCRAFT_TABLE_COLUMNS = [
   { key: "icao", label: "ICAO", sortKey: "icao", text: (item) => item.icao },
-  { key: "receiver", label: "Receiver", sortKey: "receiver", text: (item, context) => receiverDisplay(item.receiver, context.receiverHandleCollisions) },
   { key: "callsign", label: "Callsign", sortKey: "callsign", text: (item) => fmt(item.callsign) },
   { key: "altitude", label: "Altitude", sortKey: "altitude_baro_ft", text: (item) => fmt(item.altitude_baro_ft, " ft") },
   { key: "speed", label: "Speed", sortKey: "ground_speed_kt", text: (item) => fmt(speedValue(item), " kt") },
   { key: "range", label: "Range", sortKey: "distance_km", text: (item) => fixed(item.distance_km, 1, " km") },
-  { key: "bearing", label: "Bearing", sortKey: "bearing_deg", text: (item) => fixed(item.bearing_deg, 1, " deg") },
-  { key: "track", label: "Track", sortKey: "track_deg", text: (item) => fixed(item.track_deg, 1, " deg") },
-  { key: "vertical", label: "Vertical", sortKey: "vertical_rate_fpm", text: (item) => fmt(item.vertical_rate_fpm, " fpm") },
-  { key: "messages", label: "Messages", sortKey: "message_count", text: (item) => String(item.message_count) },
+  { key: "sources", label: "RX", sortKey: "receiver_count", text: (item) => String(item.receiver_count ?? 1) },
   { key: "freshness", label: "Freshness", freshness: true },
 ];
 
@@ -77,14 +72,17 @@ function App() {
   const [search, setSearch] = useState("");
   const [selectedKey, setSelectedKey] = useState(null);
   const [hoverKey, setHoverKey] = useState(null);
-  const [viewMode, setViewMode] = useState("radar");
   const [rangeKm, setRangeKm] = useState("auto");
+  const [overlays, setOverlays] = useState({ radar: true, trails: true, labels: true });
+  const [focusReceiverId, setFocusReceiverId] = useState(null);
+  const [receiverOnly, setReceiverOnly] = useState(false);
   const [clockTick, setClockTick] = useState(0);
   const [bootstrapReady, setBootstrapReady] = useState(false);
 
   const nowMs = serverClock(clockRef);
   const aggregateMode = isAggregateStatus(status);
   const receiverSite = status.receiver_site ?? null;
+  const receiverSites = useMemo(() => knownReceiverSites(status, receiverSite), [status, receiverSite]);
 
   const handleFeed = useCallback((message) => {
     setServerTime(clockRef, message.now_ms);
@@ -150,25 +148,34 @@ function App() {
     return () => window.clearInterval(timer);
   }, []);
 
-  useEffect(() => {
-    if (selectedKey && !aircraftRef.current.has(selectedKey)) setSelectedKey(null);
-    if (hoverKey && !aircraftRef.current.has(hoverKey)) setHoverKey(null);
-  }, [aircraftVersion, selectedKey, hoverKey]);
-
   const aircraftItems = useMemo(() => [...aircraftRef.current.values()], [aircraftVersion]);
+  const displayItems = useMemo(() => rollupAircraftItems(aircraftItems, focusReceiverId), [aircraftItems, focusReceiverId]);
+  const scopedItems = useMemo(() => {
+    if (!focusReceiverId || !receiverOnly) return displayItems;
+    return displayItems.filter((item) => aircraftReceiverIds(item).has(focusReceiverId));
+  }, [displayItems, focusReceiverId, receiverOnly]);
   const receiverHandleCollisions = useMemo(
     () => receiverHandleCollisionSet(aircraftItems, status.receivers ?? []),
     [aircraftItems, status.receivers],
   );
   const rows = useMemo(() => visibleRows(
-    aircraftItems,
+    scopedItems,
     { filter, search, sortKey, sortDir, receiverHandleCollisions },
-  ), [aircraftItems, filter, search, sortKey, sortDir, receiverHandleCollisions]);
+  ), [scopedItems, filter, search, sortKey, sortDir, receiverHandleCollisions]);
 
-  const selectedItem = selectedKey ? aircraftRef.current.get(selectedKey) ?? null : null;
-  const hoveredItem = hoverKey ? aircraftRef.current.get(hoverKey) ?? null : null;
-  const selectedTrail = selectedItem ? trailsRef.current.get(selectedItem.key) ?? [] : [];
-  const totalAircraft = aircraftRef.current.size;
+  const displayItemMap = useMemo(() => new Map(displayItems.map((item) => [item.key, item])), [displayItems]);
+  useEffect(() => {
+    if (selectedKey && !displayItemMap.has(selectedKey)) setSelectedKey(null);
+    if (hoverKey && !displayItemMap.has(hoverKey)) setHoverKey(null);
+  }, [displayItemMap, selectedKey, hoverKey]);
+  useEffect(() => {
+    if (!focusReceiverId) setReceiverOnly(false);
+  }, [focusReceiverId]);
+
+  const selectedItem = selectedKey ? displayItemMap.get(selectedKey) ?? null : null;
+  const hoveredItem = hoverKey ? displayItemMap.get(hoverKey) ?? null : null;
+  const selectedTrail = selectedItem ? mergedTrail(selectedItem, trailsRef.current) : [];
+  const totalAircraft = displayItems.length;
   const displayedAircraftCount = rows.length === totalAircraft ? totalAircraft : `${rows.length}/${totalAircraft}`;
 
   return (
@@ -178,31 +185,60 @@ function App() {
         statusReachable={statusReachable}
         aircraftCount={displayedAircraftCount}
         nowMs={nowMs}
+        socketState={socketState}
       />
-      <Toolbar
-        filter={filter}
-        search={search}
-        onFilterChange={setFilter}
-        onSearchChange={setSearch}
-      />
-      <section className={`visual-layout ${selectedItem ? "details-open" : ""}`} aria-label="Live aircraft visualization">
-        <ScopePanel
-          rows={rows}
-          trails={trailsRef.current}
-          receiverSite={receiverSite}
-          viewMode={viewMode}
-          rangeKm={rangeKm}
-          selectedKey={selectedKey}
-          selectedItem={selectedItem}
-          hoverKey={hoverKey}
-          hoveredItem={hoveredItem}
-          onViewModeChange={setViewMode}
-          onRangeChange={setRangeKm}
-          onHoverChange={setHoverKey}
-          onSelect={setSelectedKey}
-          receiverHandleCollisions={receiverHandleCollisions}
-        />
-        {selectedItem && (
+      <section className="ops-layout" aria-label="Live aircraft workspace">
+        <aside className="left-rail">
+          <Toolbar
+            filter={filter}
+            search={search}
+            onFilterChange={setFilter}
+            onSearchChange={setSearch}
+          />
+          <ReceiverSummaryPanel
+            receivers={status.receivers ?? []}
+            localReceiver={status.receiver ?? null}
+            rawAircraftItems={aircraftItems}
+            nowMs={nowMs}
+            focusReceiverId={focusReceiverId}
+            receiverOnly={receiverOnly}
+            receiverHandleCollisions={receiverHandleCollisions}
+            onFocusChange={setFocusReceiverId}
+            onReceiverOnlyChange={setReceiverOnly}
+          />
+          <AircraftTable
+            rows={rows}
+            sortKey={sortKey}
+            sortDir={sortDir}
+            selectedKey={selectedKey}
+            nowMs={nowMs}
+            receiverHandleCollisions={receiverHandleCollisions}
+            onSort={(key) => updateSort(key, sortKey, setSortKey, setSortDir)}
+            onSelect={(key) => setSelectedKey(selectedKey === key ? null : key)}
+          />
+        </aside>
+        <section className="center-panel" aria-label="Live aircraft map">
+          <SpatialPanel
+            rows={rows}
+            trails={trailsRef.current}
+            receiverSite={receiverSite}
+            receiverSites={receiverSites}
+            focusReceiverId={focusReceiverId}
+            rangeKm={rangeKm}
+            selectedKey={selectedKey}
+            selectedItem={selectedItem}
+            hoverKey={hoverKey}
+            hoveredItem={hoveredItem}
+            overlays={overlays}
+            onOverlayChange={setOverlays}
+            onRangeChange={setRangeKm}
+            onHoverChange={setHoverKey}
+            onSelect={setSelectedKey}
+            receiverHandleCollisions={receiverHandleCollisions}
+          />
+        </section>
+        <aside className={`right-rail ${selectedItem ? "has-selection" : "summary-open"}`}>
+          {selectedItem ? (
           <DetailsPanel
             item={selectedItem}
             trail={selectedTrail}
@@ -210,28 +246,13 @@ function App() {
             receiverHandleCollisions={receiverHandleCollisions}
             onClose={() => setSelectedKey(null)}
           />
-        )}
+          ) : (
+            <AggregateSummaryPanel status={status} statusReachable={statusReachable} nowMs={nowMs} />
+          )}
+        </aside>
       </section>
-      <AircraftTable
-        rows={rows}
-        sortKey={sortKey}
-        sortDir={sortDir}
-        selectedKey={selectedKey}
-        nowMs={nowMs}
-        receiverHandleCollisions={receiverHandleCollisions}
-        onSort={(key) => updateSort(key, sortKey, setSortKey, setSortDir)}
-        onSelect={(key) => setSelectedKey(selectedKey === key ? null : key)}
-      />
-      {aggregateMode && (
-        <ReceiverSummaryPanel
-          receivers={status.receivers ?? []}
-          nowMs={nowMs}
-          receiverHandleCollisions={receiverHandleCollisions}
-        />
-      )}
-      {aggregateMode && <AggregateSummaryPanel status={status} statusReachable={statusReachable} nowMs={nowMs} />}
       <footer className="footer">
-        <span>{socketState}</span>
+        <span>{aggregateMode ? "Aggregate" : "Collector"}</span>
         <span id="last-error">{status.last_error ?? ""}</span>
       </footer>
       <span hidden>{clockTick}</span>
@@ -239,28 +260,39 @@ function App() {
   );
 }
 
-function Header({ status, statusReachable, aircraftCount, nowMs }) {
+function Header({ status, statusReachable, aircraftCount, nowMs, socketState }) {
   const aggregateMode = isAggregateStatus(status);
-  const metrics = collectorMetrics(status, statusReachable, aircraftCount, nowMs);
-  const title = aggregateMode ? "RSDB" : "RSDB Live";
-  const subhead = aggregateMode ? aggregateSubhead(status) : receiverLabel(status.receiver, status.receiver_site);
+  const title = "RSDB";
+  const metrics = aggregateMode
+    ? [
+        ["RX", status.receiver_count ?? 0],
+        ["AC", aircraftCount],
+        ["Accepted", status.submissions_accepted ?? 0],
+        ["Last", age(status.last_submission_ms, nowMs)],
+      ]
+    : [
+        ["RX", statusReachable ? status.receiver_connected ? "Live" : "Retry" : "Offline"],
+        ["AC", aircraftCount],
+        ["Frames", `${Number(status.decoded_frames_per_second ?? 0).toFixed(1)}/s`],
+        ["USB", megabytesPerSecond(status.usb_bytes_per_second)],
+      ];
+  const subhead = aggregateMode ? aggregateSubhead(status) : receiverSiteLabel(status.receiver_site);
 
   return (
-    <header className={`topbar ${aggregateMode ? "topbar-plain" : ""}`}>
-      <div>
+    <header className="topbar">
+      <div className="brand-block">
         <h1>{title}</h1>
         <p className="subhead">{subhead}</p>
       </div>
-      {!aggregateMode && (
-        <section className="status-grid" aria-label="Receiver status">
-          {metrics.map(([labelText, value]) => (
-            <div className="metric" key={labelText}>
-              <span>{labelText}</span>
-              <strong>{value}</strong>
-            </div>
-          ))}
-        </section>
-      )}
+      <section className="status-grid" aria-label="Service status">
+        {metrics.map(([labelText, value]) => (
+          <div className="metric" key={labelText}>
+            <span>{labelText}</span>
+            <strong>{value}</strong>
+          </div>
+        ))}
+      </section>
+      <span className={`connection-state connection-${socketState.toLowerCase()}`}>{socketState}</span>
     </header>
   );
 }
@@ -311,11 +343,12 @@ function AggregateSummaryPanel({ status, statusReachable, nowMs }) {
   return (
     <section className="aggregate-summary" aria-label="Aggregate status">
       <div className="receiver-summary-head">
-        <span className="eyebrow">Service</span>
+        <span className="eyebrow">{isAggregateStatus(status) ? "Network" : "Receiver"}</span>
         <strong>{statusReachable ? "Online" : "Offline"}</strong>
       </div>
       <section className="status-grid aggregate-status-grid">
-        {aggregateMetrics(status, nowMs).map(([labelText, value]) => (
+        {(isAggregateStatus(status) ? aggregateMetrics(status, nowMs) : collectorMetrics(status, statusReachable, status.aircraft_count ?? 0, nowMs))
+          .map(([labelText, value]) => (
           <div className="metric" key={labelText}>
             <span>{labelText}</span>
             <strong>{value}</strong>
@@ -326,77 +359,82 @@ function AggregateSummaryPanel({ status, statusReachable, nowMs }) {
   );
 }
 
-function ReceiverSummaryPanel({ receivers, nowMs, receiverHandleCollisions }) {
-  const sortedReceivers = [...receivers].sort((left, right) => (
-    receiverDisplay(left.receiver, receiverHandleCollisions)
-      .localeCompare(receiverDisplay(right.receiver, receiverHandleCollisions))
-  ));
+function ReceiverSummaryPanel({
+  receivers,
+  localReceiver,
+  rawAircraftItems,
+  nowMs,
+  focusReceiverId,
+  receiverOnly,
+  receiverHandleCollisions,
+  onFocusChange,
+  onReceiverOnlyChange,
+}) {
+  const receiverRows = receiverRailRows(receivers, localReceiver, rawAircraftItems, receiverHandleCollisions);
 
   return (
     <section className="receiver-summary" aria-label="Aggregate receivers">
       <div className="receiver-summary-head">
         <span className="eyebrow">Receivers</span>
-        <strong>{sortedReceivers.length}</strong>
+        <strong>{receiverRows.length}</strong>
       </div>
       <div className="receiver-cards">
-        {sortedReceivers.length === 0 ? (
+        <button
+          type="button"
+          className={`receiver-row ${focusReceiverId ? "" : "active"}`}
+          onClick={() => onFocusChange(null)}
+        >
+          <span className="receiver-color receiver-color-all" aria-hidden="true" />
+          <span className="receiver-row-main">
+            <strong>All receivers</strong>
+            <span>{rawAircraftItems.length} observations</span>
+          </span>
+        </button>
+        {receiverRows.length === 0 ? (
           <div className="receiver-card empty-card">No receivers yet</div>
-        ) : sortedReceivers.map((summary) => (
+        ) : receiverRows.map((summary) => (
           <ReceiverCard
             summary={summary}
+            active={summary.receiver.id === focusReceiverId}
             nowMs={nowMs}
             receiverHandleCollisions={receiverHandleCollisions}
+            onFocusChange={onFocusChange}
             key={summary.receiver.id}
           />
         ))}
       </div>
+      <label className="receiver-only">
+        <input
+          type="checkbox"
+          checked={receiverOnly}
+          disabled={!focusReceiverId}
+          onChange={(event) => onReceiverOnlyChange(event.currentTarget.checked)}
+        />
+        <span>Show focused receiver only</span>
+      </label>
     </section>
   );
 }
 
-function ReceiverCard({ summary, nowMs, receiverHandleCollisions }) {
+function ReceiverCard({ summary, active, nowMs, receiverHandleCollisions, onFocusChange }) {
   const health = receiverHealth(summary, nowMs);
 
   return (
-    <article className={`receiver-card receiver-card-${health.level}`}>
-      <div className="receiver-card-top">
-        <div className="receiver-card-title">{receiverDisplay(summary.receiver, receiverHandleCollisions)}</div>
+    <button
+      type="button"
+      className={`receiver-row receiver-row-${health.level} ${active ? "active" : ""}`}
+      onClick={() => onFocusChange(summary.receiver.id)}
+    >
+      <span className="receiver-color" style={{ background: receiverColor({ receiver: summary.receiver }) }} aria-hidden="true" />
+      <span className="receiver-row-main">
+        <strong>{receiverDisplay(summary.receiver, receiverHandleCollisions)}</strong>
+        <span>{summary.aircraft_count ?? 0} aircraft - {summary.messages_accepted ?? 0} messages</span>
+      </span>
         <span className={`receiver-health receiver-health-${health.level}`} title={health.title}>
           <span aria-hidden="true" />
           {health.label}
         </span>
-      </div>
-      <dl>
-        <div>
-          <dt>Aircraft</dt>
-          <dd>{summary.aircraft_count ?? 0}</dd>
-        </div>
-        <div>
-          <dt>Messages</dt>
-          <dd>{summary.messages_accepted ?? 0}</dd>
-        </div>
-        <div>
-          <dt>Last Message</dt>
-          <dd>{age(summary.last_message_ms, nowMs)}</dd>
-        </div>
-        <div>
-          <dt>Last Submit</dt>
-          <dd>{age(summary.last_submission_ms, nowMs)}</dd>
-        </div>
-        <div>
-          <dt>Queued</dt>
-          <dd>{summary.submission?.outbox_pending ?? 0}</dd>
-        </div>
-        <div>
-          <dt>Delivered</dt>
-          <dd>{summary.submission?.delivered ?? "-"}</dd>
-        </div>
-        <div>
-          <dt>Targets</dt>
-          <dd>{targetHealthLabel(summary.submission)}</dd>
-        </div>
-      </dl>
-    </article>
+    </button>
   );
 }
 
@@ -427,28 +465,95 @@ function Toolbar({ filter, search, onFilterChange, onSearchChange }) {
   );
 }
 
-function ScopePanel({
+function SpatialPanel({
   rows,
   trails,
   receiverSite,
-  viewMode,
+  receiverSites,
+  focusReceiverId,
   rangeKm,
   selectedKey,
   selectedItem,
   hoverKey,
   hoveredItem,
+  overlays,
   receiverHandleCollisions,
-  onViewModeChange,
+  onOverlayChange,
   onRangeChange,
   onHoverChange,
   onSelect,
 }) {
+  const mapContainerRef = useRef(null);
   const canvasRef = useRef(null);
+  const mapRef = useRef(null);
   const targetsRef = useRef([]);
+  const [mapStatus, setMapStatus] = useState("loading");
   const [resizeVersion, setResizeVersion] = useState(0);
   const positioned = useMemo(() => rows.filter(hasPosition), [rows]);
-  const effectiveRange = effectiveRangeKm(rows, positioned, rangeKm, receiverSite, trails);
+  const focusSite = focusedReceiverSite(receiverSites, focusReceiverId) ?? receiverSite;
+  const centerSite = spatialCenter(rows, receiverSites, focusSite);
+  const effectiveRange = effectiveRangeKm(rows, positioned, rangeKm, centerSite, trails, receiverSites);
   const readoutItem = hoveredItem ?? selectedItem;
+
+  useEffect(() => {
+    if (!mapContainerRef.current) return undefined;
+
+    let readyTimer = null;
+    let resizeObserver = null;
+    let ready = false;
+    let map = null;
+
+    try {
+      const center = spatialCenter(rows, receiverSites, focusSite);
+      map = new maplibregl.Map({
+        container: mapContainerRef.current,
+        style: MAP_STYLE_URL,
+        center: [center.lon, center.lat],
+        zoom: 8,
+        attributionControl: false,
+        dragRotate: false,
+        pitchWithRotate: false,
+      });
+      mapRef.current = map;
+
+      const markReady = () => {
+        if (ready) return;
+        ready = true;
+        if (readyTimer !== null) window.clearTimeout(readyTimer);
+        setMapStatus("ok");
+        setResizeVersion((version) => version + 1);
+      };
+
+      readyTimer = window.setTimeout(() => {
+        setMapStatus("failed");
+        setResizeVersion((version) => version + 1);
+      }, MAP_READY_TIMEOUT_MS);
+      map.on("load", markReady);
+      map.on("styledata", markReady);
+      map.on("move", () => setResizeVersion((version) => version + 1));
+
+      resizeObserver = new ResizeObserver(() => {
+        map.resize();
+        setResizeVersion((version) => version + 1);
+      });
+      resizeObserver.observe(mapContainerRef.current);
+    } catch {
+      setMapStatus("failed");
+      setResizeVersion((version) => version + 1);
+    }
+
+    return () => {
+      if (readyTimer !== null) window.clearTimeout(readyTimer);
+      if (resizeObserver) resizeObserver.disconnect();
+      if (map) map.remove();
+      mapRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (mapStatus !== "ok" || !mapRef.current) return;
+    fitSpatialMap(mapRef.current, rows, trails, receiverSites, focusSite, rangeKm);
+  }, [mapStatus, rangeKm, receiverSites, focusSite, rows.length, trails]);
 
   useEffect(() => {
     const onResize = () => setResizeVersion((version) => version + 1);
@@ -457,18 +562,21 @@ function ScopePanel({
   }, []);
 
   useEffect(() => {
-    targetsRef.current = drawScope({
+    targetsRef.current = drawSpatialOverlay({
       canvas: canvasRef.current,
       rows,
       trails,
       receiverSite,
-      viewMode,
+      receiverSites,
+      focusSite,
+      map: mapStatus === "ok" ? mapRef.current : null,
       rangeKm,
       selectedKey,
       hoverKey,
+      overlays,
       receiverHandleCollisions,
     });
-  }, [rows, trails, receiverSite, viewMode, rangeKm, selectedKey, hoverKey, receiverHandleCollisions, resizeVersion]);
+  }, [rows, trails, receiverSite, receiverSites, focusSite, mapStatus, rangeKm, selectedKey, hoverKey, overlays, receiverHandleCollisions, resizeVersion]);
 
   function handlePointerMove(event) {
     const target = targetFromEvent(event, canvasRef.current, targetsRef.current);
@@ -481,22 +589,30 @@ function ScopePanel({
     if (target) onSelect(target.key);
   }
 
+  function toggleOverlay(key) {
+    onOverlayChange((current) => ({ ...current, [key]: !current[key] }));
+  }
+
   return (
-    <section className="scope-panel">
+    <section className={`scope-panel spatial-panel map-${mapStatus}`}>
       <div className="scope-head">
         <div>
           <span className="eyebrow">Scope</span>
-          <h2>{viewMode === "map" ? "Map" : "Radar"}</h2>
+          <h2>Map</h2>
           <p className="scope-summary">{positioned.length} positioned / {rows.length} visible</p>
         </div>
         <div className="scope-controls">
-          <div className="segments compact" role="group" aria-label="Scope mode">
-            {VIEW_MODES.map(([value, labelText]) => (
+          <div className="segments compact" role="group" aria-label="Overlays">
+            {[
+              ["radar", "Radar"],
+              ["trails", "Trails"],
+              ["labels", "Labels"],
+            ].map(([value, labelText]) => (
               <button
                 type="button"
-                className={segmentClass(viewMode === value)}
+                className={segmentClass(overlays[value])}
                 key={value}
-                onClick={() => onViewModeChange(value)}
+                onClick={() => toggleOverlay(value)}
               >
                 {labelText}
               </button>
@@ -517,14 +633,21 @@ function ScopePanel({
         </div>
       </div>
       <div className="scope-canvas-wrap">
+        <div ref={mapContainerRef} className="map-base" aria-hidden="true" />
+        {mapStatus === "failed" && <div className="map-fallback" aria-hidden="true" />}
+        <div className="map-scrim" aria-hidden="true" />
         <canvas
           ref={canvasRef}
           id="scope-canvas"
-          aria-label="Live aircraft scope"
+          className="radar-canvas"
+          aria-label="Live aircraft map"
           onPointerMove={handlePointerMove}
           onPointerLeave={() => onHoverChange(null)}
           onClick={handleClick}
         />
+        {mapStatus === "failed" && (
+          <span className="map-badge">Map tiles unavailable, radar overlay active</span>
+        )}
       </div>
       <div className="scope-footer">
         <span>{scopeReadout(readoutItem, positioned.length, rows.length, receiverSite, receiverHandleCollisions)}</span>
@@ -562,6 +685,7 @@ function DetailsPanel({ item, trail, nowMs, receiverHandleCollisions, onClose })
           </span>
         ))}
       </div>
+      <ObservationList item={item} nowMs={nowMs} receiverHandleCollisions={receiverHandleCollisions} />
       {groups.map((group) => (
         <section className="details-section" key={group.title}>
           <h3>{group.title}</h3>
@@ -586,6 +710,36 @@ function DetailsPanel({ item, trail, nowMs, receiverHandleCollisions, onClose })
         ))}
       </ol>
     </aside>
+  );
+}
+
+function ObservationList({ item, nowMs, receiverHandleCollisions }) {
+  const observations = item.observations ?? [item];
+
+  return (
+    <section className="details-section observation-section">
+      <h3>Sources</h3>
+      <div className="observation-list">
+        {observations.map((observation) => {
+          const state = freshness(observation, nowMs);
+          return (
+            <article className="observation-row" key={observation.key}>
+              <div className="observation-row-top">
+                <span className="receiver-color" style={{ background: receiverColor(observation) }} aria-hidden="true" />
+                <strong>{receiverDisplay(observation.receiver, receiverHandleCollisions)}</strong>
+                <span className={`observation-age observation-age-${state.level}`}>{state.age || state.label}</span>
+              </div>
+              <div className="observation-metrics">
+                <span>{fixed(observation.distance_km, 1, " km")}</span>
+                <span>{fixed(observation.bearing_deg, 0, " deg")}</span>
+                <span>{fmt(observation.altitude_baro_ft, " ft")}</span>
+                <span>{fmt(speedValue(observation), " kt")}</span>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -688,7 +842,8 @@ function detailsGroups(item, trail, receiverHandleCollisions) {
     {
       title: "Track",
       fields: [
-        { label: "Receiver", value: receiverDisplay(item.receiver, receiverHandleCollisions) },
+        { label: "Primary Receiver", value: receiverDisplay(item.receiver, receiverHandleCollisions) },
+        { label: "Sources", value: `${item.receiver_count ?? 1}` },
         { label: "Position", value: hasPosition(item) ? `${fixed(item.lat, 5)}, ${fixed(item.lon, 5)}` : "-", sourceMs: item.position_last_seen_ms },
         { label: "Position Status", value: label(item.position_status), sourceMs: item.position_last_seen_ms },
         { label: "Position Age", ageMs: item.position_last_seen_ms, sourceMs: item.position_last_seen_ms },
@@ -866,18 +1021,12 @@ function megabytesPerSecond(bytesPerSecond) {
 
 function receiverSiteLabel(site) {
   if (!site) return "1090 MHz ADS-B receiver";
-  const coords = `${Number(site.lat).toFixed(4)}, ${Number(site.lon).toFixed(4)}`;
-  return site.name ? `${site.name} - ${coords}` : coords;
+  return `${Number(site.lat).toFixed(4)}, ${Number(site.lon).toFixed(4)}`;
 }
 
 function receiverLabel(receiverIdentity, site) {
   if (!receiverIdentity) return receiverSiteLabel(site);
-
-  const receiver = receiverDisplay(receiverIdentity);
-  if (!site) return receiver;
-
-  const coords = `${Number(site.lat).toFixed(4)}, ${Number(site.lon).toFixed(4)}`;
-  return `${receiver} - ${coords}`;
+  return receiverDisplay(receiverIdentity);
 }
 
 function receiverDisplay(receiverIdentity, receiverHandleCollisions = null) {
@@ -1024,6 +1173,218 @@ function normalizeAircraftItem(value, receiverIdentity) {
   const item = receiver ? { ...value, receiver } : { ...value };
   item.key = aircraftKey(item.icao, receiver);
   return item;
+}
+
+function rollupAircraftItems(items, focusReceiverId) {
+  const groups = new Map();
+  for (const item of items) {
+    if (!item.icao) continue;
+    if (!groups.has(item.icao)) groups.set(item.icao, []);
+    groups.get(item.icao).push(item);
+  }
+
+  return [...groups.entries()].map(([icao, observations]) => {
+    const sortedObservations = observations
+      .slice()
+      .sort((left, right) => Number(right.last_seen_ms ?? 0) - Number(left.last_seen_ms ?? 0));
+    const primary = choosePrimaryObservation(sortedObservations, focusReceiverId);
+    const merged = {
+      ...primary,
+      key: icao,
+      icao,
+      observations: sortedObservations,
+      source_keys: sortedObservations.map((item) => item.key),
+      receiver_count: aircraftReceiverIds({ observations: sortedObservations }).size,
+      message_count: sortedObservations.reduce((total, item) => total + Number(item.message_count ?? 0), 0),
+      raw_messages: sortedObservations.flatMap((item) => item.raw_messages ?? []).slice(-24),
+    };
+
+    mergeObservationFields(merged, sortedObservations);
+    return merged;
+  });
+}
+
+function choosePrimaryObservation(observations, focusReceiverId) {
+  if (focusReceiverId) {
+    const focused = observations.find((item) => item.receiver?.id === focusReceiverId);
+    if (focused) return focused;
+  }
+  return observations.find(hasPosition) ?? observations[0];
+}
+
+function mergeObservationFields(merged, observations) {
+  for (const group of OBSERVATION_FIELD_GROUPS) {
+    const source = latestObservationForGroup(observations, group);
+    if (!source) continue;
+    for (const field of group.fields) merged[field] = source[field];
+  }
+}
+
+function latestObservationForGroup(observations, group) {
+  return observations
+    .filter(group.present)
+    .sort((left, right) => Number(right[group.timeField] ?? right.last_seen_ms ?? 0) - Number(left[group.timeField] ?? left.last_seen_ms ?? 0))[0]
+    ?? null;
+}
+
+const OBSERVATION_FIELD_GROUPS = [
+  {
+    timeField: "callsign_last_seen_ms",
+    fields: ["callsign", "category", "callsign_last_seen_ms"],
+    present: (item) => item.callsign !== null && item.callsign !== undefined,
+  },
+  {
+    timeField: "position_last_seen_ms",
+    fields: ["lat", "lon", "position_status", "position_last_seen_ms", "distance_km", "bearing_deg"],
+    present: hasPosition,
+  },
+  {
+    timeField: "altitude_last_seen_ms",
+    fields: [
+      "altitude_baro_ft",
+      "altitude_geometric_ft",
+      "altitude_last_seen_ms",
+      "surveillance_status",
+      "nic_supplement_b",
+    ],
+    present: (item) => item.altitude_baro_ft !== null && item.altitude_baro_ft !== undefined
+      || item.altitude_geometric_ft !== null && item.altitude_geometric_ft !== undefined,
+  },
+  {
+    timeField: "velocity_last_seen_ms",
+    fields: [
+      "ground_speed_kt",
+      "airspeed_kt",
+      "speed_type",
+      "track_deg",
+      "heading_deg",
+      "vertical_rate_fpm",
+      "vertical_rate_source",
+      "velocity_last_seen_ms",
+    ],
+    present: hasVelocity,
+  },
+  {
+    timeField: "operational_status_last_seen_ms",
+    fields: [
+      "nac_p",
+      "source_integrity_level",
+      "adsb_version",
+      "operational_status_last_seen_ms",
+    ],
+    present: (item) => item.operational_status_last_seen_ms !== null && item.operational_status_last_seen_ms !== undefined,
+  },
+  {
+    timeField: "aircraft_status_last_seen_ms",
+    fields: [
+      "aircraft_status_subtype",
+      "aircraft_status_last_seen_ms",
+      "emergency_state",
+      "emergency_state_code",
+      "mode_a_identity_code",
+    ],
+    present: (item) => item.aircraft_status_last_seen_ms !== null && item.aircraft_status_last_seen_ms !== undefined,
+  },
+  {
+    timeField: "target_state_last_seen_ms",
+    fields: ["target_state_subtype", "target_state_last_seen_ms"],
+    present: (item) => item.target_state_last_seen_ms !== null && item.target_state_last_seen_ms !== undefined,
+  },
+];
+
+function aircraftReceiverIds(item) {
+  const ids = new Set();
+  for (const observation of item.observations ?? [item]) {
+    if (observation.receiver?.id) ids.add(observation.receiver.id);
+  }
+  return ids;
+}
+
+function mergedTrail(item, trails) {
+  const points = (item.source_keys ?? [item.key])
+    .flatMap((key) => trails.get(key) ?? [])
+    .sort((left, right) => Number(left.time ?? 0) - Number(right.time ?? 0));
+  if (points.length <= TRAIL_MAX_POINTS) return points;
+  return points.slice(points.length - TRAIL_MAX_POINTS);
+}
+
+function receiverRailRows(receivers, localReceiver, rawAircraftItems, receiverHandleCollisions) {
+  const summaries = new Map();
+  for (const summary of receivers) {
+    if (summary.receiver?.id) summaries.set(summary.receiver.id, summary);
+  }
+
+  if (localReceiver?.id && !summaries.has(localReceiver.id)) {
+    summaries.set(localReceiver.id, {
+      receiver: localReceiver,
+      aircraft_count: rawAircraftItems.filter((item) => item.receiver?.id === localReceiver.id).length,
+      messages_accepted: rawAircraftItems.reduce((total, item) => (
+        item.receiver?.id === localReceiver.id ? total + Number(item.message_count ?? 0) : total
+      ), 0),
+      last_message_ms: latestReceiverMessageMs(rawAircraftItems, localReceiver.id),
+      last_submission_ms: null,
+      receiver_connected: null,
+      submission: null,
+    });
+  }
+
+  for (const item of rawAircraftItems) {
+    const receiver = item.receiver;
+    if (!receiver?.id || summaries.has(receiver.id)) continue;
+    summaries.set(receiver.id, {
+      receiver,
+      aircraft_count: rawAircraftItems.filter((candidate) => candidate.receiver?.id === receiver.id).length,
+      messages_accepted: rawAircraftItems.reduce((total, candidate) => (
+        candidate.receiver?.id === receiver.id ? total + Number(candidate.message_count ?? 0) : total
+      ), 0),
+      last_message_ms: latestReceiverMessageMs(rawAircraftItems, receiver.id),
+      last_submission_ms: null,
+      receiver_connected: null,
+      submission: null,
+    });
+  }
+
+  return [...summaries.values()].sort((left, right) => (
+    receiverDisplay(left.receiver, receiverHandleCollisions)
+      .localeCompare(receiverDisplay(right.receiver, receiverHandleCollisions))
+  ));
+}
+
+function latestReceiverMessageMs(items, receiverId) {
+  return items
+    .filter((item) => item.receiver?.id === receiverId)
+    .reduce((latest, item) => Math.max(latest, Number(item.last_seen_ms ?? 0)), 0)
+    || null;
+}
+
+function knownReceiverSites(status, localSite) {
+  const sites = new Map();
+  for (const summary of status.receivers ?? []) {
+    if (summary.receiver?.id && validSite(summary.receiver_site)) {
+      sites.set(summary.receiver.id, {
+        receiver: summary.receiver,
+        site: summary.receiver_site,
+      });
+    }
+  }
+
+  if (status.receiver?.id && validSite(localSite) && !sites.has(status.receiver.id)) {
+    sites.set(status.receiver.id, {
+      receiver: status.receiver,
+      site: localSite,
+    });
+  }
+
+  return [...sites.values()];
+}
+
+function focusedReceiverSite(receiverSites, focusReceiverId) {
+  if (!focusReceiverId) return null;
+  return receiverSites.find((entry) => entry.receiver?.id === focusReceiverId)?.site ?? null;
+}
+
+function validSite(site) {
+  return Boolean(site) && numeric(site.lat) && numeric(site.lon);
 }
 
 function receiverColor(item) {
@@ -1241,23 +1602,201 @@ function visibleRows(items, { filter, search, sortKey, sortDir, receiverHandleCo
     .sort((left, right) => compareRows(left, right, sortKey, sortDir, receiverHandleCollisions));
 }
 
-function effectiveRangeKm(rows, positioned, rangeSetting, receiverSite, trails) {
+function drawSpatialOverlay({
+  canvas,
+  rows,
+  trails,
+  receiverSite,
+  receiverSites,
+  focusSite,
+  map,
+  rangeKm,
+  selectedKey,
+  hoverKey,
+  overlays,
+  receiverHandleCollisions,
+}) {
+  if (!canvas) return [];
+
+  const context = canvas.getContext("2d");
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return [];
+
+  const scale = window.devicePixelRatio || 1;
+  const width = Math.round(rect.width);
+  const height = Math.round(rect.height);
+  const canvasWidth = Math.round(width * scale);
+  const canvasHeight = Math.round(height * scale);
+
+  if (canvas.width !== canvasWidth || canvas.height !== canvasHeight) {
+    canvas.width = canvasWidth;
+    canvas.height = canvasHeight;
+  }
+
+  context.save();
+  context.scale(scale, scale);
+  context.clearRect(0, 0, width, height);
+
+  const positioned = rows.filter(hasPosition);
+  const centerSite = spatialCenter(rows, receiverSites, focusSite ?? receiverSite);
+  const effectiveRange = effectiveRangeKm(rows, positioned, rangeKm, centerSite, trails, receiverSites);
+  const projector = makeSpatialProjector(width, height, effectiveRange, positioned, centerSite, map);
+  const targets = [];
+
+  if (!map) {
+    drawRadarBackground(context, projector, width, height, effectiveRange);
+  } else if (overlays.radar) {
+    drawRadarOverlay(context, projector, width, height, effectiveRange, centerSite);
+  }
+
+  if (overlays.trails) {
+    for (const item of rows) drawTrail(context, projector, item, trails, selectedKey, hoverKey);
+  }
+  drawReceiverSites(context, projector, receiverSites, focusSite);
+  for (const item of rows) {
+    drawAircraftTarget(
+      context,
+      projector,
+      item,
+      positioned.length,
+      selectedKey,
+      hoverKey,
+      targets,
+      overlays.labels,
+    );
+  }
+  drawReceiverLegend(context, rows, width, receiverHandleCollisions);
+
+  context.restore();
+  return targets;
+}
+
+function makeSpatialProjector(width, height, rangeKm, positioned, receiverSite, map) {
+  const fallback = makeMapProjector(width, height, rangeKm, positioned, receiverSite);
+  const center = receiverSite ?? fallback.center;
+
+  return {
+    ...fallback,
+    mode: map ? "spatial" : fallback.mode,
+    center,
+    projectLatLon(lat, lon) {
+      if (!numeric(lat) || !numeric(lon)) return null;
+      if (!map) return mapPoint(fallback, lat, lon);
+      const point = map.project([lon, lat]);
+      return {
+        x: point.x,
+        y: point.y,
+        distanceKm: haversineDistanceKm(center.lat, center.lon, lat, lon),
+        bearingDeg: initialBearingDeg(center.lat, center.lon, lat, lon),
+      };
+    },
+    projectItem(item) {
+      return hasPosition(item) ? this.projectLatLon(item.lat, item.lon) : null;
+    },
+    projectTrail(point) {
+      return this.projectLatLon(point.lat, point.lon);
+    },
+    ringRadius(distanceKm) {
+      if (!map || !receiverSite) return distanceKm / rangeKm * fallback.radius;
+      const centerPoint = map.project([receiverSite.lon, receiverSite.lat]);
+      const edge = destinationPoint(receiverSite.lat, receiverSite.lon, 0, distanceKm);
+      const edgePoint = map.project([edge.lon, edge.lat]);
+      return Math.hypot(edgePoint.x - centerPoint.x, edgePoint.y - centerPoint.y);
+    },
+  };
+}
+
+function drawRadarOverlay(context, projector, width, height, rangeKm, receiverSite) {
+  const centerPoint = receiverSite
+    ? projector.projectLatLon(receiverSite.lat, receiverSite.lon)
+    : { x: width / 2, y: height / 2 };
+  if (!centerPoint) return;
+
+  context.save();
+  context.fillStyle = "rgba(0, 0, 0, 0.15)";
+  context.fillRect(0, 0, width, height);
+  context.strokeStyle = "rgba(122, 171, 155, 0.34)";
+  context.lineWidth = 1;
+
+  for (let ring = 1; ring <= 4; ring += 1) {
+    const ringKm = rangeKm * ring / 4;
+    const radius = projector.ringRadius(ringKm);
+    context.beginPath();
+    context.arc(centerPoint.x, centerPoint.y, radius, 0, Math.PI * 2);
+    context.stroke();
+    drawScopeText(context, `${Math.round(ringKm)} km`, centerPoint.x + 8, centerPoint.y - radius + 13, "#9db9ae", "left");
+  }
+
+  drawScopeLine(context, centerPoint.x, centerPoint.y - projector.ringRadius(rangeKm), centerPoint.x, centerPoint.y + projector.ringRadius(rangeKm));
+  drawScopeLine(context, centerPoint.x - projector.ringRadius(rangeKm), centerPoint.y, centerPoint.x + projector.ringRadius(rangeKm), centerPoint.y);
+  context.restore();
+}
+
+function fitSpatialMap(map, rows, trails, receiverSites, focusSite, rangeKm) {
+  const positioned = rows.filter(hasPosition);
+  const center = spatialCenter(rows, receiverSites, focusSite);
+  const effectiveRange = effectiveRangeKm(rows, positioned, rangeKm, center, trails, receiverSites);
+  const latDelta = effectiveRange / 111.32;
+  const lonDelta = effectiveRange / Math.max(1, 111.32 * Math.cos(degreesToRadians(center.lat)));
+
+  map.fitBounds(
+    [
+      [center.lon - lonDelta, center.lat - latDelta],
+      [center.lon + lonDelta, center.lat + latDelta],
+    ],
+    { padding: 58, duration: 250, maxZoom: 12 },
+  );
+}
+
+function spatialCenter(rows, receiverSites, focusSite = null) {
+  if (validSite(focusSite)) {
+    return { lat: focusSite.lat, lon: focusSite.lon };
+  }
+
+  const positioned = rows.filter(hasPosition);
+  if (positioned.length > 0) return averagePosition(positioned, null);
+
+  const sites = receiverSites
+    .map((entry) => entry.site)
+    .filter(validSite);
+  if (sites.length > 0) return averagePosition(sites, null);
+
+  return DEFAULT_CENTER;
+}
+
+function destinationPoint(lat, lon, bearingDeg, distanceKm) {
+  const angularDistance = distanceKm / EARTH_RADIUS_KM;
+  const bearing = degreesToRadians(bearingDeg);
+  const lat1 = degreesToRadians(lat);
+  const lon1 = degreesToRadians(lon);
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(angularDistance)
+      + Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing),
+  );
+  const lon2 = lon1 + Math.atan2(
+    Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+    Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2),
+  );
+  return { lat: radiansToDegrees(lat2), lon: normalizeLongitude(radiansToDegrees(lon2)) };
+}
+
+function effectiveRangeKm(rows, positioned, rangeSetting, center, trails, receiverSites = []) {
   if (rangeSetting !== "auto") return Number(rangeSetting);
 
+  const centerSite = validSite(center) ? center : spatialCenter(rows, receiverSites);
   let maxDistance = 0;
   for (const item of rows) {
-    const rangeBearing = rangeBearingForItem(item, receiverSite);
-    if (rangeBearing) maxDistance = Math.max(maxDistance, rangeBearing.distanceKm);
-    for (const point of trails.get(item.key) ?? []) {
-      const pointRange = rangeBearingForPoint(point, receiverSite);
-      if (pointRange) maxDistance = Math.max(maxDistance, pointRange.distanceKm);
+    if (hasPosition(item)) {
+      maxDistance = Math.max(maxDistance, haversineDistanceKm(centerSite.lat, centerSite.lon, item.lat, item.lon));
+    }
+    for (const point of mergedTrail(item, trails)) {
+      maxDistance = Math.max(maxDistance, haversineDistanceKm(centerSite.lat, centerSite.lon, point.lat, point.lon));
     }
   }
 
-  if (maxDistance === 0 && positioned.length > 1) {
-    const center = averagePosition(positioned, receiverSite);
-    for (const item of positioned) {
-      maxDistance = Math.max(maxDistance, haversineDistanceKm(center.lat, center.lon, item.lat, item.lon));
+  for (const entry of receiverSites) {
+    if (validSite(entry.site)) {
+      maxDistance = Math.max(maxDistance, haversineDistanceKm(centerSite.lat, centerSite.lon, entry.site.lat, entry.site.lon));
     }
   }
 
@@ -1407,7 +1946,6 @@ function drawRadarBackground(context, projector, width, height, rangeKm) {
   drawScopeText(context, "E", projector.centerX + projector.radius + 10, projector.centerY + 4, "#f1f7f3", "center");
   drawScopeText(context, "S", projector.centerX, projector.centerY + projector.radius + 20, "#f1f7f3", "center");
   drawScopeText(context, "W", projector.centerX - projector.radius - 10, projector.centerY + 4, "#f1f7f3", "center");
-  drawReceiver(context, projector.centerX, projector.centerY);
 }
 
 function drawMapBackground(context, projector, width, height, rangeKm) {
@@ -1427,7 +1965,6 @@ function drawMapBackground(context, projector, width, height, rangeKm) {
   drawScopeLine(context, projector.centerX - projector.radius, projector.centerY, projector.centerX + projector.radius, projector.centerY);
   drawScopeText(context, `${fixed(projector.center.lat, 3)}, ${fixed(projector.center.lon, 3)}`, 14, height - 14, "#b9c9c1", "left");
   drawScopeText(context, `${rangeKm} km`, width - 14, height - 14, "#b9c9c1", "right");
-  drawReceiver(context, projector.centerX, projector.centerY);
 }
 
 function drawScopeBase(context, width, height) {
@@ -1437,21 +1974,28 @@ function drawScopeBase(context, width, height) {
   context.fillRect(0, 0, width, height);
 }
 
-function drawReceiver(context, x, y) {
-  context.save();
-  context.translate(x, y);
-  context.fillStyle = "#f7cb6f";
-  context.strokeStyle = "#0e181b";
-  context.lineWidth = 2;
-  context.beginPath();
-  context.moveTo(0, -7);
-  context.lineTo(7, 0);
-  context.lineTo(0, 7);
-  context.lineTo(-7, 0);
-  context.closePath();
-  context.fill();
-  context.stroke();
-  context.restore();
+function drawReceiverSites(context, projector, receiverSites, focusSite) {
+  for (const entry of receiverSites) {
+    if (!validSite(entry.site)) continue;
+    const point = projector.projectLatLon(entry.site.lat, entry.site.lon);
+    if (!point) continue;
+    const focused = focusSite === entry.site;
+
+    context.save();
+    context.translate(point.x, point.y);
+    context.fillStyle = focused ? "#f5cb62" : colorWithAlpha(receiverColor({ receiver: entry.receiver }), 0.95);
+    context.strokeStyle = "#061014";
+    context.lineWidth = focused ? 3 : 2;
+    context.beginPath();
+    context.moveTo(0, focused ? -9 : -7);
+    context.lineTo(focused ? 9 : 7, 0);
+    context.lineTo(0, focused ? 9 : 7);
+    context.lineTo(focused ? -9 : -7, 0);
+    context.closePath();
+    context.fill();
+    context.stroke();
+    context.restore();
+  }
 }
 
 function drawScopeLine(context, x1, y1, x2, y2) {
@@ -1470,7 +2014,7 @@ function drawScopeText(context, text, x, y, color, align) {
 }
 
 function drawTrail(context, projector, item, trails, selectedKey, hoverKey) {
-  const trail = trails.get(item.key) ?? [];
+  const trail = mergedTrail(item, trails);
   if (trail.length < 2) return;
 
   const points = trail
@@ -1489,7 +2033,7 @@ function drawTrail(context, projector, item, trails, selectedKey, hoverKey) {
   context.restore();
 }
 
-function drawAircraftTarget(context, projector, item, positionedCount, selectedKey, hoverKey, targets) {
+function drawAircraftTarget(context, projector, item, positionedCount, selectedKey, hoverKey, targets, showLabels = true) {
   const point = projector.projectItem(item);
   if (!point) return;
 
@@ -1522,7 +2066,7 @@ function drawAircraftTarget(context, projector, item, positionedCount, selectedK
   context.stroke();
   context.restore();
 
-  if (selected || hovered || positionedCount <= 14) {
+  if (showLabels && (selected || hovered || positionedCount <= 14)) {
     drawAircraftLabel(context, item, point.x + 10, point.y - 10, selected || hovered);
   }
 }
@@ -1662,6 +2206,10 @@ function radiansToDegrees(value) {
 
 function normalizeDegrees(value) {
   return ((value % 360) + 360) % 360;
+}
+
+function normalizeLongitude(value) {
+  return ((value + 540) % 360) - 180;
 }
 
 function upsertAircraft(item, nowMs, aircraft, trails, clockRef) {

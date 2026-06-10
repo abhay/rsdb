@@ -4,7 +4,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AircraftSnapshot, FeedMessage, FeedStats, Protocol, ReceiverIdentity, SubmissionHealth,
+    AircraftSnapshot, FeedMessage, FeedStats, Protocol, ReceiverIdentity, ReceiverSite,
+    SubmissionHealth,
     feed::{
         API_SCHEMA_VERSION, ApiEndpoint, ApiSchema, FeedMessageSchema, FieldSchema, WebSocketSchema,
     },
@@ -312,6 +313,8 @@ impl AggregateAircraftSnapshot {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct AggregateReceiverSummary {
     pub receiver: ReceiverIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_site: Option<ReceiverSite>,
     pub aircraft_count: usize,
     pub messages_accepted: u64,
     pub last_message_ms: Option<u64>,
@@ -729,6 +732,10 @@ impl AggregateStore {
             .values()
             .map(|receiver| AggregateReceiverSummary {
                 receiver: receiver.receiver.clone(),
+                receiver_site: receiver
+                    .latest_stats
+                    .as_ref()
+                    .and_then(|stats| stats.receiver_site.clone()),
                 aircraft_count: receiver.aircraft.len(),
                 messages_accepted: receiver.messages_accepted,
                 last_message_ms: receiver.last_message_ms,
@@ -1031,6 +1038,11 @@ mod tests {
     fn aggregate_store_exposes_receiver_heartbeat_health() {
         let mut store = AggregateStore::new();
         let mut stats = FeedStats {
+            receiver_site: Some(ReceiverSite {
+                name: None,
+                lat: 37.753,
+                lon: -122.447,
+            }),
             receiver_connected: true,
             ..FeedStats::default()
         };
@@ -1051,6 +1063,10 @@ mod tests {
         let summary = &aggregate_status.receivers[0];
 
         assert_eq!(summary.last_heartbeat_ms, Some(100));
+        assert_eq!(
+            summary.receiver_site.as_ref().map(|site| site.lat),
+            Some(37.753)
+        );
         assert_eq!(summary.receiver_connected, Some(true));
         assert_eq!(
             summary

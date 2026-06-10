@@ -98,6 +98,8 @@ impl ReceiverIdentity {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct FeedStats {
     pub uptime_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_site: Option<ReceiverSite>,
     pub receiver_connected: bool,
     pub last_frame_ms: Option<u64>,
     pub last_usb_chunk_ms: Option<u64>,
@@ -265,6 +267,7 @@ impl Default for FeedStats {
     fn default() -> Self {
         Self {
             uptime_ms: 0,
+            receiver_site: None,
             receiver_connected: false,
             last_frame_ms: None,
             last_usb_chunk_ms: None,
@@ -1187,12 +1190,14 @@ pub fn replay_frame_records(
         if config.heartbeat_interval_ms != 0
             && record.now_ms.saturating_sub(last_heartbeat_ms) >= config.heartbeat_interval_ms
         {
+            let mut stats = counters.stats(record.now_ms, config.initial_now_ms);
+            stats.receiver_site.clone_from(&config.receiver_site);
             messages.push(
                 FeedMessage::heartbeat_for_protocol(
                     config.protocol,
                     record.now_ms,
                     store.aircraft_count(),
-                    counters.stats(record.now_ms, config.initial_now_ms),
+                    stats,
                 )
                 .with_receiver(receiver_identity.clone()),
             );
@@ -1217,6 +1222,7 @@ impl FrameReplayCounters {
 
         FeedStats {
             uptime_ms,
+            receiver_site: None,
             receiver_connected: true,
             last_frame_ms: self.last_frame_ms,
             last_usb_chunk_ms: None,
@@ -1561,6 +1567,11 @@ mod tests {
                 "aircraft_count": 3,
                 "stats": {
                     "uptime_ms": 12345,
+                    "receiver_site": {
+                        "name": "SF",
+                        "lat": 37.753,
+                        "lon": -122.447,
+                    },
                     "receiver_connected": true,
                     "last_frame_ms": 98,
                     "last_usb_chunk_ms": 97,
@@ -1634,6 +1645,11 @@ mod tests {
     fn sample_stats() -> FeedStats {
         FeedStats {
             uptime_ms: 12_345,
+            receiver_site: Some(ReceiverSite {
+                name: Some("SF".to_owned()),
+                lat: 37.753,
+                lon: -122.447,
+            }),
             receiver_connected: true,
             last_frame_ms: Some(98),
             last_usb_chunk_ms: Some(97),

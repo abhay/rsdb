@@ -314,6 +314,7 @@ impl FeedCounters {
 
         FeedStats {
             uptime_ms,
+            receiver_site: None,
             receiver_connected,
             last_frame_ms: self.last_frame_ms,
             last_usb_chunk_ms: self.last_usb_chunk_ms,
