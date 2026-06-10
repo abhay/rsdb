@@ -24,7 +24,7 @@ flowchart LR
   Outbox -. optional HTTPS .-> RemoteAgg[Remote aggregate<br/>Fly.io or other host]
   LocalAgg --> Writer[Single aggregate writer<br/>verify, dedupe, mutate state]
   RemoteAgg --> RemoteWriter[Single aggregate writer]
-  Writer --> HotStore[Hot persistence<br/>snapshot.json<br/>submissions.ndjson]
+  Writer --> HotStore[Hot persistence<br/>aggregate.sqlite3]
   RemoteWriter --> RemoteHotStore[Hot persistence]
   Writer --> PublicAPI[UI/API/WebSocket]
   RemoteWriter --> RemoteAPI[UI/API/WebSocket]
@@ -60,8 +60,8 @@ rsdb-aggregate
     +-- verify allowlist and signature
     +-- dedupe submission_id
     +-- maintain receiver-scoped aircraft state
-    +-- append accepted submissions to hot journal
-    +-- periodically checkpoint and compact
+    +-- insert accepted submissions into SQLite
+    +-- periodically prune by age and hot size
     |
     +-- public HTTP and WebSocket API
 ```
@@ -86,9 +86,9 @@ sequenceDiagram
   A->>A: verify allowlist and signature
   A->>A: enqueue to single aggregate writer
   A->>A: dedupe submission_id
-  A->>P: append accepted SignedSubmission
+  A->>P: insert accepted SignedSubmission
   A->>A: update AggregateStore
-  A->>P: periodic sync, checkpoint, and compaction
+  A->>P: periodic prune and WAL checkpoint
   A-->>Q: 202 accepted or duplicate
 
   U->>A: GET /
@@ -108,7 +108,7 @@ sequenceDiagram
 6. The worker POSTs queued submissions to each configured aggregate /submit.
 7. The aggregate verifies the allowlist and signature.
 8. The HTTP worker queues the verified submission to the single writer.
-9. The writer dedupes submission_id and appends accepted submissions to disk.
+9. The writer dedupes submission_id and inserts accepted submissions into SQLite.
 10. The writer decodes frame batches into receiver-scoped state and broadcasts live FeedMessage updates.
 11. Browser/API clients bootstrap from HTTP JSON, then use WebSocket for live updates.
 ```
@@ -137,15 +137,17 @@ latest-aircraft.json
 Aggregate persistence is hot serving state:
 
 ```text
-snapshot.json
-submissions.ndjson
+aggregate.sqlite3
+aggregate.sqlite3-wal
+aggregate.sqlite3-shm
 ```
 
 The aggregate keeps current serving state in memory. Accepted submissions are
-queued through 1 writer, appended to the hot journal, and periodically
-checkpointed/compacted by age and size. It keeps hot serving state only; evicted
-hot submissions are intentionally removed from local storage. Cold export can
-be added later.
+queued through 1 writer, inserted into SQLite, and periodically pruned by age
+and configured hot size. The hot size limit tracks logical submission bytes;
+SQLite reuses freed pages and attempts incremental vacuuming after prune work.
+The aggregate keeps hot serving state only; evicted hot submissions are
+intentionally removed from local storage. Cold export can be added later.
 
 ## Trust Model
 

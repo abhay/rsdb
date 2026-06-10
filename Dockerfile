@@ -11,7 +11,7 @@ FROM rust:1.95-slim AS builder
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates pkg-config \
+    && apt-get install -y --no-install-recommends ca-certificates build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock package.json bun.lock tsconfig.json ./

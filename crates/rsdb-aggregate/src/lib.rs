@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
@@ -10,9 +10,10 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rsdb::{
-    AggregateIngestResult, AggregatePersistenceStatus, AggregateStore, AggregateStorePersistence,
-    FeedMessage, ReceiverAllowlist, ReceiverIdentity, SignedSubmission, SubmissionPayload,
+    AggregateIngestResult, AggregatePersistenceStatus, AggregateStore, FeedMessage,
+    ReceiverAllowlist, ReceiverIdentity, SignedSubmission, SubmissionPayload,
 };
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
 const INDEX_HTML: &str = include_str!("../../../web/static/index.html");
@@ -42,11 +43,11 @@ pub struct ServeConfig<'a> {
 /// listener cannot bind, or persistence initialization fails.
 pub fn serve(config: ServeConfig<'_>) -> Result<(), String> {
     let allowlist = read_allowlist(config.allowlist)?;
-    let persistence = config
+    let mut persistence = config
         .data_dir
         .map(|dir| AggregatePersistence::open(dir, config.retention_ms, config.max_bytes))
         .transpose()?;
-    let store = persistence.as_ref().map_or_else(
+    let store = persistence.as_mut().map_or_else(
         || Ok(AggregateStore::new()),
         |persistence| persistence.load_store(&allowlist),
     )?;
@@ -478,11 +479,9 @@ impl HttpRequest {
     }
 }
 
-#[derive(Debug)]
 struct AggregatePersistence {
-    data_dir: PathBuf,
-    snapshot_path: PathBuf,
-    submissions_path: PathBuf,
+    db_path: PathBuf,
+    connection: Connection,
     retention_ms: u64,
     max_bytes: u64,
     state: Mutex<AggregatePersistenceState>,
@@ -492,15 +491,51 @@ impl AggregatePersistence {
     fn open(data_dir: &Path, retention_ms: u64, max_bytes: u64) -> Result<Self, String> {
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("{}: create failed: {error}", data_dir.display()))?;
+        let db_path = data_dir.join("aggregate.sqlite3");
+        let connection =
+            Connection::open(&db_path).map_err(|error| sqlite_error(&db_path, "open", error))?;
+        Self::configure_connection(&connection, &db_path)?;
+        Self::migrate(&connection, &db_path)?;
+        let state = Self::read_state_from(&connection, &db_path, 0)?;
 
         Ok(Self {
-            data_dir: data_dir.to_owned(),
-            snapshot_path: data_dir.join("snapshot.json"),
-            submissions_path: data_dir.join("submissions.ndjson"),
+            db_path,
+            connection,
             retention_ms,
             max_bytes,
-            state: Mutex::new(AggregatePersistenceState::default()),
+            state: Mutex::new(state),
         })
+    }
+
+    fn configure_connection(connection: &Connection, db_path: &Path) -> Result<(), String> {
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = FULL;
+                 PRAGMA auto_vacuum = INCREMENTAL;
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA busy_timeout = 5000;",
+            )
+            .map_err(|error| sqlite_error(db_path, "configure", error))
+    }
+
+    fn migrate(connection: &Connection, db_path: &Path) -> Result<(), String> {
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS submissions (
+                    submission_id TEXT PRIMARY KEY NOT NULL,
+                    receiver_id TEXT NOT NULL,
+                    submitted_at_ms INTEGER NOT NULL,
+                    payload_kind TEXT NOT NULL,
+                    body_json TEXT NOT NULL,
+                    body_bytes INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_submissions_submitted_at
+                    ON submissions(submitted_at_ms);
+                CREATE INDEX IF NOT EXISTS idx_submissions_receiver_submitted_at
+                    ON submissions(receiver_id, submitted_at_ms);",
+            )
+            .map_err(|error| sqlite_error(db_path, "migrate", error))
     }
 
     fn status(&self) -> AggregatePersistenceStatus {
@@ -510,7 +545,7 @@ impl AggregatePersistence {
             .expect("aggregate persistence state mutex not poisoned");
         AggregatePersistenceStatus {
             enabled: true,
-            path: Some(self.data_dir.display().to_string()),
+            path: Some(self.db_path.display().to_string()),
             retention_ms: Some(self.retention_ms),
             max_bytes: Some(self.max_bytes),
             log_bytes: Some(state.log_bytes),
@@ -519,56 +554,45 @@ impl AggregatePersistence {
         }
     }
 
-    fn load_store(&self, allowlist: &ReceiverAllowlist) -> Result<AggregateStore, String> {
-        let mut store = self.load_snapshot()?;
-        let compacted = self.compact_submission_log(unix_time_ms())?;
+    fn load_store(&mut self, allowlist: &ReceiverAllowlist) -> Result<AggregateStore, String> {
+        self.prune_submissions(unix_time_ms())?;
 
-        self.replay_submissions(&mut store, allowlist, &compacted.entries)?;
-        store.retain_accepted_submission_ids(&retained_submission_ids(&compacted.entries));
-        if compacted.compacted {
-            self.save_snapshot(&store)?;
-        }
-        *self
-            .state
-            .lock()
-            .expect("aggregate persistence state mutex not poisoned") = compacted.state;
+        let mut store = AggregateStore::new();
+        self.replay_submissions(&mut store, allowlist)?;
 
         Ok(store)
-    }
-
-    fn load_snapshot(&self) -> Result<AggregateStore, String> {
-        let contents = match fs::read_to_string(&self.snapshot_path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(AggregateStore::new());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "{}: read failed: {error}",
-                    self.snapshot_path.display()
-                ));
-            }
-        };
-        let persistence = serde_json::from_str::<AggregateStorePersistence>(&contents)
-            .map_err(|error| format!("{}: invalid JSON: {error}", self.snapshot_path.display()))?;
-
-        AggregateStore::from_persistence(persistence)
-            .map_err(|error| format!("{}: {error}", self.snapshot_path.display()))
     }
 
     fn replay_submissions(
         &self,
         store: &mut AggregateStore,
         allowlist: &ReceiverAllowlist,
-        submissions: &[SubmissionLogEntry],
     ) -> Result<(), String> {
-        for (index, entry) in submissions.iter().enumerate() {
-            let submission = &entry.submission;
-            if store.has_accepted_submission_id(&submission.submission_id) {
-                continue;
-            }
-            let payload = verified_submission_payload(allowlist, submission).map_err(|error| {
-                format!("{}:{}: {error}", self.submissions_path.display(), index + 1)
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT body_json
+                 FROM submissions
+                 ORDER BY submitted_at_ms ASC, rowid ASC",
+            )
+            .map_err(|error| sqlite_error(&self.db_path, "prepare replay", error))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| sqlite_error(&self.db_path, "query replay", error))?;
+
+        for (index, row) in rows.enumerate() {
+            let body_json =
+                row.map_err(|error| sqlite_error(&self.db_path, "read replay", error))?;
+            let submission =
+                serde_json::from_str::<SignedSubmission>(&body_json).map_err(|error| {
+                    format!(
+                        "{}:row {}: invalid signed submission JSON: {error}",
+                        self.db_path.display(),
+                        index + 1
+                    )
+                })?;
+            let payload = verified_submission_payload(allowlist, &submission).map_err(|error| {
+                format!("{}:row {}: {error}", self.db_path.display(), index + 1)
             })?;
             replay_verified_payload(
                 store,
@@ -578,8 +602,8 @@ impl AggregatePersistence {
             )
             .map_err(|error| {
                 format!(
-                    "{}:{}: invalid submission payload: {error}",
-                    self.submissions_path.display(),
+                    "{}:row {}: invalid submission payload: {error}",
+                    self.db_path.display(),
                     index + 1
                 )
             })?;
@@ -589,46 +613,57 @@ impl AggregatePersistence {
     }
 
     fn append_submission(
-        &self,
+        &mut self,
         submission: &SignedSubmission,
     ) -> Result<PersistenceSaveResult, String> {
-        let line_bytes = submission_line_bytes(submission)?;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.submissions_path)
-            .map_err(|error| {
-                format!("{}: open failed: {error}", self.submissions_path.display())
-            })?;
-
-        serde_json::to_writer(&mut file, submission).map_err(|error| {
-            format!(
-                "{}: write JSON failed: {error}",
-                self.submissions_path.display()
+        let body_json = submission_body_json(submission)?;
+        let body_bytes = u64::try_from(body_json.len()).unwrap_or(u64::MAX);
+        let db_path = self.db_path.clone();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| sqlite_error(&db_path, "begin insert", error))?;
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO submissions (
+                    submission_id,
+                    receiver_id,
+                    submitted_at_ms,
+                    payload_kind,
+                    body_json,
+                    body_bytes
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    submission.submission_id,
+                    submission.receiver_id,
+                    to_sql_i64(submission.submitted_at_ms, "submitted_at_ms")?,
+                    submission.payload.kind(),
+                    body_json,
+                    to_sql_i64(body_bytes, "body_bytes")?,
+                ],
             )
-        })?;
-        file.write_all(b"\n").map_err(|error| {
-            format!("{}: write failed: {error}", self.submissions_path.display())
-        })?;
-        file.flush().map_err(|error| {
-            format!("{}: flush failed: {error}", self.submissions_path.display())
-        })?;
+            .map_err(|error| sqlite_error(&db_path, "insert submission", error))?;
+        transaction
+            .commit()
+            .map_err(|error| sqlite_error(&db_path, "commit insert", error))?;
 
         let mut state = self
             .state
             .lock()
             .expect("aggregate persistence state mutex not poisoned");
-        state.log_records = state.log_records.saturating_add(1);
-        state.log_bytes = state.log_bytes.saturating_add(line_bytes);
-        state.records_since_checkpoint = state.records_since_checkpoint.saturating_add(1);
-        state.oldest_submitted_at_ms = state
-            .oldest_submitted_at_ms
-            .map_or(Some(submission.submitted_at_ms), |oldest| {
-                Some(oldest.min(submission.submitted_at_ms))
-            });
+        if inserted > 0 {
+            state.log_records = state.log_records.saturating_add(usize_to_u64(inserted));
+            state.log_bytes = state.log_bytes.saturating_add(body_bytes);
+            state.records_since_checkpoint = state.records_since_checkpoint.saturating_add(1);
+            state.oldest_submitted_at_ms = state
+                .oldest_submitted_at_ms
+                .map_or(Some(submission.submitted_at_ms), |oldest| {
+                    Some(oldest.min(submission.submitted_at_ms))
+                });
+        }
 
         Ok(PersistenceSaveResult {
-            writes: 1,
+            writes: usize_to_u64(inserted),
             log_bytes: Some(state.log_bytes),
             log_records: Some(state.log_records),
             ..PersistenceSaveResult::default()
@@ -636,7 +671,7 @@ impl AggregatePersistence {
     }
 
     fn maintain(
-        &self,
+        &mut self,
         store: &mut AggregateStore,
         now_ms: u64,
     ) -> Result<PersistenceSaveResult, String> {
@@ -651,40 +686,13 @@ impl AggregatePersistence {
                 .is_some_and(|oldest| oldest < now_ms.saturating_sub(self.retention_ms));
         drop(state);
 
-        if compact_due {
-            let compacted = self.compact_submission_log(now_ms)?;
-            let mut result = PersistenceSaveResult {
-                compacted: compacted.compacted,
-                log_bytes: Some(compacted.state.log_bytes),
-                log_records: Some(compacted.state.log_records),
-                ..PersistenceSaveResult::default()
-            };
-            if compacted.compacted {
-                store.retain_accepted_submission_ids(&retained_submission_ids(&compacted.entries));
-                self.save_snapshot(store)?;
-                result.writes = result.writes.saturating_add(2);
+        if compact_due || checkpoint_due {
+            let result = self.prune_submissions(now_ms)?;
+            if result.compacted {
+                store.retain_accepted_submission_ids(&self.retained_submission_ids()?);
             }
-            *self
-                .state
-                .lock()
-                .expect("aggregate persistence state mutex not poisoned") = compacted.state;
+            self.checkpoint_database()?;
             return Ok(result);
-        }
-
-        if checkpoint_due {
-            self.sync_submission_log()?;
-            self.save_snapshot(store)?;
-            let mut state = self
-                .state
-                .lock()
-                .expect("aggregate persistence state mutex not poisoned");
-            state.records_since_checkpoint = 0;
-            return Ok(PersistenceSaveResult {
-                writes: 1,
-                log_bytes: Some(state.log_bytes),
-                log_records: Some(state.log_records),
-                ..PersistenceSaveResult::default()
-            });
         }
 
         let state = self
@@ -698,221 +706,219 @@ impl AggregatePersistence {
         })
     }
 
-    fn sync_submission_log(&self) -> Result<(), String> {
-        let file = match fs::File::open(&self.submissions_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(format!(
-                    "{}: open failed: {error}",
-                    self.submissions_path.display()
-                ));
-            }
-        };
-        file.sync_data()
-            .map_err(|error| format!("{}: sync failed: {error}", self.submissions_path.display()))
-    }
-
-    fn save_snapshot(&self, store: &AggregateStore) -> Result<(), String> {
-        let tmp_path = self.snapshot_tmp_path();
-        let file = fs::File::create(&tmp_path)
-            .map_err(|error| format!("{}: create failed: {error}", tmp_path.display()))?;
-        let mut writer = BufWriter::new(file);
-
-        serde_json::to_writer(&mut writer, &store.persistence_snapshot())
-            .map_err(|error| format!("{}: write JSON failed: {error}", tmp_path.display()))?;
-        writer
-            .write_all(b"\n")
-            .map_err(|error| format!("{}: write failed: {error}", tmp_path.display()))?;
-        writer
-            .flush()
-            .map_err(|error| format!("{}: flush failed: {error}", tmp_path.display()))?;
-        writer
-            .get_ref()
-            .sync_data()
-            .map_err(|error| format!("{}: sync failed: {error}", tmp_path.display()))?;
-        fs::rename(&tmp_path, &self.snapshot_path).map_err(|error| {
-            format!(
-                "{} -> {}: rename failed: {error}",
-                tmp_path.display(),
-                self.snapshot_path.display()
-            )
-        })
-    }
-
-    fn compact_submission_log(&self, now_ms: u64) -> Result<CompactSubmissionLogResult, String> {
-        let read = self.read_submission_log()?;
-        let original_bytes = read.original_bytes;
-        let mut entries = read.entries;
+    fn prune_submissions(&mut self, now_ms: u64) -> Result<PersistenceSaveResult, String> {
         let cutoff_ms = now_ms.saturating_sub(self.retention_ms);
-        entries.sort_by_key(|entry| entry.submission.submitted_at_ms);
-
-        entries.retain(|entry| entry.submission.submitted_at_ms >= cutoff_ms);
-        let mut retained_bytes = entries
-            .iter()
-            .fold(0_u64, |bytes, entry| bytes.saturating_add(entry.line_bytes));
-        let target_bytes = if retained_bytes > self.max_bytes {
-            compaction_target_bytes(self.max_bytes)
-        } else {
-            self.max_bytes
-        };
-        let mut first_retained = 0_usize;
-        while retained_bytes > target_bytes && first_retained + 1 < entries.len() {
-            retained_bytes = retained_bytes.saturating_sub(entries[first_retained].line_bytes);
-            first_retained += 1;
+        let removed_by_time = self.delete_submissions_older_than(cutoff_ms)?;
+        let removed_by_size = self.prune_submissions_by_size()?;
+        let removed = removed_by_time.saturating_add(removed_by_size);
+        if removed > 0 {
+            self.reclaim_free_pages()?;
         }
-        if first_retained > 0 {
-            entries.drain(0..first_retained);
-        }
-        let state = AggregatePersistenceState::from_entries(&entries);
-        let compacted = original_bytes != state.log_bytes;
+        let state = self.refresh_state(0)?;
 
-        if compacted {
-            self.write_submission_log(&entries)?;
-        }
-
-        Ok(CompactSubmissionLogResult {
-            entries,
-            state,
-            compacted,
+        Ok(PersistenceSaveResult {
+            writes: removed,
+            compacted: removed > 0,
+            log_bytes: Some(state.log_bytes),
+            log_records: Some(state.log_records),
         })
     }
 
-    fn read_submission_log(&self) -> Result<SubmissionLogRead, String> {
-        let file = match fs::File::open(&self.submissions_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(SubmissionLogRead::default());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "{}: open failed: {error}",
-                    self.submissions_path.display()
-                ));
-            }
-        };
-        let mut reader = BufReader::new(file);
-        let mut entries = Vec::new();
-        let mut original_bytes = 0_u64;
-        let mut line_number = 0_usize;
-
-        loop {
-            let mut line = Vec::new();
-            let read = reader.read_until(b'\n', &mut line).map_err(|error| {
-                format!("{}: read failed: {error}", self.submissions_path.display())
-            })?;
-            if read == 0 {
-                break;
-            }
-
-            line_number += 1;
-            original_bytes = original_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-            let complete_line = line.last().is_some_and(|byte| *byte == b'\n');
-            let trimmed = trim_ascii_whitespace(&line);
-            if is_ignorable_journal_line(trimmed) {
-                continue;
-            }
-            let submission = match serde_json::from_slice::<SignedSubmission>(trimmed) {
-                Ok(submission) => submission,
-                Err(_) if !complete_line => continue,
-                Err(error) => {
-                    return Err(format!(
-                        "{}:{line_number}: invalid signed submission JSON: {error}",
-                        self.submissions_path.display()
-                    ));
-                }
-            };
-            entries.push(SubmissionLogEntry {
-                line_bytes: submission_line_bytes(&submission)?,
-                submission,
-            });
-        }
-
-        Ok(SubmissionLogRead {
-            entries,
-            original_bytes,
-        })
-    }
-
-    fn write_submission_log(&self, entries: &[SubmissionLogEntry]) -> Result<(), String> {
-        let tmp_path = self.submissions_tmp_path();
-        let file = fs::File::create(&tmp_path)
-            .map_err(|error| format!("{}: create failed: {error}", tmp_path.display()))?;
-        let mut writer = BufWriter::new(file);
-
-        for entry in entries {
-            serde_json::to_writer(&mut writer, &entry.submission)
-                .map_err(|error| format!("{}: write JSON failed: {error}", tmp_path.display()))?;
-            writer
-                .write_all(b"\n")
-                .map_err(|error| format!("{}: write failed: {error}", tmp_path.display()))?;
-        }
-        writer
-            .flush()
-            .map_err(|error| format!("{}: flush failed: {error}", tmp_path.display()))?;
-        writer
-            .get_ref()
-            .sync_data()
-            .map_err(|error| format!("{}: sync failed: {error}", tmp_path.display()))?;
-        fs::rename(&tmp_path, &self.submissions_path).map_err(|error| {
-            format!(
-                "{} -> {}: rename failed: {error}",
-                tmp_path.display(),
-                self.submissions_path.display()
+    fn delete_submissions_older_than(&mut self, cutoff_ms: u64) -> Result<u64, String> {
+        let cutoff_ms = to_sql_i64(cutoff_ms, "submitted_at_ms")?;
+        let db_path = self.db_path.clone();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| sqlite_error(&db_path, "begin retention delete", error))?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM submissions WHERE submitted_at_ms < ?1",
+                params![cutoff_ms],
             )
+            .map_err(|error| sqlite_error(&db_path, "delete expired submissions", error))?;
+        transaction
+            .commit()
+            .map_err(|error| sqlite_error(&db_path, "commit retention delete", error))?;
+
+        Ok(usize_to_u64(removed))
+    }
+
+    fn prune_submissions_by_size(&mut self) -> Result<u64, String> {
+        let state = self.read_state()?;
+        if state.log_bytes <= self.max_bytes || state.log_records <= 1 {
+            return Ok(0);
+        }
+
+        let mut retained_bytes = state.log_bytes;
+        let delete_limit = state.log_records.saturating_sub(1);
+        let target_bytes = compaction_target_bytes(self.max_bytes);
+        let mut delete_ids = Vec::new();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT submission_id, body_bytes
+                 FROM submissions
+                 ORDER BY submitted_at_ms ASC, rowid ASC",
+            )
+            .map_err(|error| sqlite_error(&self.db_path, "prepare size prune", error))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| sqlite_error(&self.db_path, "query size prune", error))?;
+
+        while retained_bytes > target_bytes && usize_to_u64(delete_ids.len()) < delete_limit {
+            let Some(row) = rows
+                .next()
+                .map_err(|error| sqlite_error(&self.db_path, "read size prune", error))?
+            else {
+                break;
+            };
+            let submission_id = row
+                .get::<_, String>(0)
+                .map_err(|error| sqlite_error(&self.db_path, "read prune id", error))?;
+            let body_bytes = sql_i64_to_u64(
+                row.get::<_, i64>(1)
+                    .map_err(|error| sqlite_error(&self.db_path, "read prune size", error))?,
+                "body_bytes",
+                &self.db_path,
+            )?;
+            retained_bytes = retained_bytes.saturating_sub(body_bytes);
+            delete_ids.push(submission_id);
+        }
+        drop(rows);
+        drop(statement);
+
+        self.delete_submission_ids(&delete_ids)
+    }
+
+    fn delete_submission_ids(&mut self, submission_ids: &[String]) -> Result<u64, String> {
+        if submission_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let db_path = self.db_path.clone();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| sqlite_error(&db_path, "begin size delete", error))?;
+        let mut removed = 0_u64;
+        {
+            let mut statement = transaction
+                .prepare("DELETE FROM submissions WHERE submission_id = ?1")
+                .map_err(|error| sqlite_error(&db_path, "prepare size delete", error))?;
+            for submission_id in submission_ids {
+                let changed = statement
+                    .execute(params![submission_id])
+                    .map_err(|error| sqlite_error(&db_path, "delete old submission", error))?;
+                removed = removed.saturating_add(usize_to_u64(changed));
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| sqlite_error(&db_path, "commit size delete", error))?;
+
+        Ok(removed)
+    }
+
+    fn retained_submission_ids(&self) -> Result<BTreeSet<String>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT submission_id FROM submissions")
+            .map_err(|error| sqlite_error(&self.db_path, "prepare retained ids", error))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| sqlite_error(&self.db_path, "query retained ids", error))?;
+        let mut ids = BTreeSet::new();
+        for row in rows {
+            ids.insert(
+                row.map_err(|error| sqlite_error(&self.db_path, "read retained id", error))?,
+            );
+        }
+
+        Ok(ids)
+    }
+
+    fn checkpoint_database(&self) -> Result<(), String> {
+        self.connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                let _: i64 = row.get(0)?;
+                let _: i64 = row.get(1)?;
+                let _: i64 = row.get(2)?;
+                Ok(())
+            })
+            .map_err(|error| sqlite_error(&self.db_path, "checkpoint", error))
+    }
+
+    fn reclaim_free_pages(&self) -> Result<(), String> {
+        let freelist_count = self
+            .connection
+            .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+            .map_err(|error| sqlite_error(&self.db_path, "read freelist", error))?;
+        let pages = sql_i64_to_u64(freelist_count, "freelist_count", &self.db_path)?;
+        if pages == 0 {
+            return Ok(());
+        }
+
+        self.connection
+            .execute_batch(&format!("PRAGMA incremental_vacuum({pages});"))
+            .map_err(|error| sqlite_error(&self.db_path, "vacuum", error))
+    }
+
+    fn read_state(&self) -> Result<AggregatePersistenceState, String> {
+        Self::read_state_from(&self.connection, &self.db_path, 0)
+    }
+
+    fn refresh_state(
+        &self,
+        records_since_checkpoint: u64,
+    ) -> Result<AggregatePersistenceState, String> {
+        let state =
+            Self::read_state_from(&self.connection, &self.db_path, records_since_checkpoint)?;
+        *self
+            .state
+            .lock()
+            .expect("aggregate persistence state mutex not poisoned") = state;
+
+        Ok(state)
+    }
+
+    fn read_state_from(
+        connection: &Connection,
+        db_path: &Path,
+        records_since_checkpoint: u64,
+    ) -> Result<AggregatePersistenceState, String> {
+        let (log_records, log_bytes, oldest_submitted_at_ms) = connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(body_bytes), 0), MIN(submitted_at_ms)
+                 FROM submissions",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| sqlite_error(db_path, "read state", error))?;
+
+        Ok(AggregatePersistenceState {
+            log_records: sql_i64_to_u64(log_records, "COUNT(*)", db_path)?,
+            log_bytes: sql_i64_to_u64(log_bytes, "SUM(body_bytes)", db_path)?,
+            oldest_submitted_at_ms: oldest_submitted_at_ms
+                .map(|value| sql_i64_to_u64(value, "MIN(submitted_at_ms)", db_path))
+                .transpose()?,
+            records_since_checkpoint,
         })
-    }
-
-    fn snapshot_tmp_path(&self) -> PathBuf {
-        self.data_dir.join(".snapshot.json.tmp")
-    }
-
-    fn submissions_tmp_path(&self) -> PathBuf {
-        self.data_dir.join(".submissions.ndjson.tmp")
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct AggregatePersistenceState {
     log_records: u64,
     log_bytes: u64,
     oldest_submitted_at_ms: Option<u64>,
     records_since_checkpoint: u64,
-}
-
-impl AggregatePersistenceState {
-    fn from_entries(entries: &[SubmissionLogEntry]) -> Self {
-        Self {
-            log_records: u64::try_from(entries.len()).unwrap_or(u64::MAX),
-            log_bytes: entries
-                .iter()
-                .fold(0_u64, |bytes, entry| bytes.saturating_add(entry.line_bytes)),
-            oldest_submitted_at_ms: entries
-                .iter()
-                .map(|entry| entry.submission.submitted_at_ms)
-                .min(),
-            records_since_checkpoint: 0,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct SubmissionLogEntry {
-    submission: SignedSubmission,
-    line_bytes: u64,
-}
-
-#[derive(Debug, Default)]
-struct SubmissionLogRead {
-    entries: Vec<SubmissionLogEntry>,
-    original_bytes: u64,
-}
-
-#[derive(Debug)]
-struct CompactSubmissionLogResult {
-    entries: Vec<SubmissionLogEntry>,
-    state: AggregatePersistenceState,
-    compacted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -923,13 +929,6 @@ struct PersistenceSaveResult {
     log_records: Option<u64>,
 }
 
-fn retained_submission_ids(submissions: &[SubmissionLogEntry]) -> BTreeSet<String> {
-    submissions
-        .iter()
-        .map(|entry| entry.submission.submission_id.clone())
-        .collect()
-}
-
 fn compaction_target_bytes(max_bytes: u64) -> u64 {
     max_bytes
         .saturating_mul(AGGREGATE_COMPACTION_TARGET_PERCENT)
@@ -937,28 +936,29 @@ fn compaction_target_bytes(max_bytes: u64) -> u64 {
         .max(1)
 }
 
-fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-
-    &bytes[start..end]
+fn sqlite_error(path: &Path, action: &str, error: impl std::fmt::Display) -> String {
+    format!("{}: SQLite {action} failed: {error}", path.display())
 }
 
-fn is_ignorable_journal_line(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .all(|byte| *byte == 0 || byte.is_ascii_whitespace())
+fn to_sql_i64(value: u64, column: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| format!("{column} value {value} does not fit SQLite INTEGER"))
 }
 
-fn submission_line_bytes(submission: &SignedSubmission) -> Result<u64, String> {
-    let bytes = serde_json::to_vec(submission).map_err(|error| error.to_string())?;
-    Ok(u64::try_from(bytes.len() + 1).unwrap_or(u64::MAX))
+fn sql_i64_to_u64(value: i64, column: &str, path: &Path) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| {
+        format!(
+            "{}: SQLite returned negative {column} value {value}",
+            path.display()
+        )
+    })
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn submission_body_json(submission: &SignedSubmission) -> Result<String, String> {
+    serde_json::to_string(submission).map_err(|error| error.to_string())
 }
 
 #[derive(Debug)]
@@ -995,6 +995,7 @@ fn spawn_writer(
     thread::Builder::new()
         .name("rsdb-aggregate-writer".to_owned())
         .spawn(move || {
+            let mut persistence = persistence;
             for command in receiver {
                 match command {
                     WriterCommand::Submit {
@@ -1006,7 +1007,7 @@ fn spawn_writer(
                     } => {
                         let result = writer_submit(
                             &store,
-                            persistence.as_ref(),
+                            persistence.as_mut(),
                             &persistence_status,
                             &submission_id,
                             &submission,
@@ -1031,7 +1032,7 @@ fn spawn_writer(
 
 fn writer_submit(
     store: &RwLock<AggregateStore>,
-    persistence: Option<&AggregatePersistence>,
+    mut persistence: Option<&mut AggregatePersistence>,
     persistence_status: &Mutex<AggregatePersistenceStatus>,
     submission_id: &str,
     submission: &SignedSubmission,
@@ -1044,7 +1045,7 @@ fn writer_submit(
         .has_accepted_submission_id(submission_id);
 
     if is_new_submission {
-        persist_submission(persistence, persistence_status, submission)?;
+        persist_submission(persistence.as_deref_mut(), persistence_status, submission)?;
     }
 
     let mut store = store.write().expect("aggregate store rwlock not poisoned");
@@ -1090,7 +1091,7 @@ fn replay_verified_payload(
 }
 
 fn persist_submission(
-    persistence: Option<&AggregatePersistence>,
+    persistence: Option<&mut AggregatePersistence>,
     persistence_status: &Mutex<AggregatePersistenceStatus>,
     submission: &SignedSubmission,
 ) -> Result<(), SubmitError> {
@@ -1111,7 +1112,7 @@ fn persist_submission(
 }
 
 fn maintain_persistence(
-    persistence: Option<&AggregatePersistence>,
+    persistence: Option<&mut AggregatePersistence>,
     persistence_status: &Mutex<AggregatePersistenceStatus>,
     store: &mut AggregateStore,
 ) {
@@ -1362,7 +1363,7 @@ struct ErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use ed25519_dalek::{Signer, SigningKey};
     use rsdb::{FeedMessage, Frame, FrameRecord, FrameRecordBatch, Protocol, ReceiverIdentity};
@@ -1461,7 +1462,7 @@ mod tests {
 
         let first = hub.submit(&body).unwrap();
         let write_status = hub.status_json();
-        let restored_persistence =
+        let mut restored_persistence =
             AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
         let restored_store = restored_persistence
             .load_store(&allowlist_for(&signing_key))
@@ -1475,7 +1476,7 @@ mod tests {
         let status = restored_hub.status_json();
 
         assert!(!first.duplicate);
-        assert!(dir.join("submissions.ndjson").is_file());
+        assert!(dir.join("aggregate.sqlite3").is_file());
         assert!(second.duplicate);
         assert_eq!(status.submissions_accepted, 1);
         assert_eq!(status.submissions_duplicate, 1);
@@ -1484,7 +1485,10 @@ mod tests {
         assert_eq!(write_status.persistence.writes, 1);
         assert!(write_status.persistence.last_write_ms.is_some());
         assert!(status.persistence.enabled);
-        assert_eq!(status.persistence.path, Some(dir.display().to_string()));
+        assert_eq!(
+            status.persistence.path,
+            Some(dir.join("aggregate.sqlite3").display().to_string())
+        );
         assert_eq!(status.persistence.retention_ms, Some(retention_ms));
         assert_eq!(status.persistence.max_bytes, Some(max_bytes));
         assert!(status.persistence.log_bytes.is_some_and(|bytes| bytes > 0));
@@ -1495,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_compacts_submission_log_by_disk_size() {
+    fn persistence_prunes_submissions_by_logical_size() {
         let signing_key = sample_signing_key();
         let allowlist = allowlist_for(&signing_key);
         let dir = temp_test_dir("rsdb-aggregate-disk-size");
@@ -1503,7 +1507,7 @@ mod tests {
         let now_ms = unix_time_ms();
         let first_submission = signed_submission_at(&signing_key, now_ms);
         let fresh_submission = signed_submission_at(&signing_key, now_ms + 1);
-        let max_bytes = submission_line_bytes(&fresh_submission).unwrap();
+        let max_bytes = submission_body_bytes(&fresh_submission);
         let persistence = AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
         let hub = Hub::with_store(allowlist.clone(), AggregateStore::new(), Some(persistence));
 
@@ -1513,9 +1517,14 @@ mod tests {
             .unwrap();
         let compacted_status = hub.status_json();
 
-        let log = fs::read_to_string(dir.join("submissions.ndjson")).unwrap();
-        assert!(!log.contains(&first_submission.submission_id));
-        assert!(log.contains(&fresh_submission.submission_id));
+        assert_eq!(
+            stored_submission_count(&dir, &first_submission.submission_id),
+            0
+        );
+        assert_eq!(
+            stored_submission_count(&dir, &fresh_submission.submission_id),
+            1
+        );
         assert!(compacted_status.persistence.compactions >= 1);
         assert!(compacted_status.persistence.last_compaction_ms.is_some());
         assert_eq!(compacted_status.persistence.log_records, Some(1));
@@ -1526,7 +1535,7 @@ mod tests {
                 .is_some_and(|bytes| bytes <= max_bytes)
         );
 
-        let restored_persistence =
+        let mut restored_persistence =
             AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
         let restored_store = restored_persistence.load_store(&allowlist).unwrap();
         let restored_hub = Hub::with_store(allowlist, restored_store, Some(restored_persistence));
@@ -1548,12 +1557,8 @@ mod tests {
         let submissions = (0..6)
             .map(|offset| signed_submission_at(&signing_key, now_ms + offset))
             .collect::<Vec<_>>();
-        let max_line_bytes = submissions
-            .iter()
-            .map(|submission| submission_line_bytes(submission).unwrap())
-            .max()
-            .unwrap();
-        let max_bytes = max_line_bytes * 3;
+        let max_record_bytes = submissions.iter().map(submission_body_bytes).max().unwrap();
+        let max_bytes = max_record_bytes * 3;
         let persistence = AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
         let hub = Hub::with_store(
             allowlist_for(&signing_key),
@@ -1580,66 +1585,37 @@ mod tests {
     }
 
     #[test]
-    fn persistence_recovers_from_trailing_journal_residue() {
+    fn persistence_prunes_submissions_by_retention_window() {
         let signing_key = sample_signing_key();
-        let allowlist = allowlist_for(&signing_key);
-        let dir = temp_test_dir("rsdb-aggregate-journal-residue");
-        let retention_ms = 24 * 60 * 60 * 1_000;
+        let dir = temp_test_dir("rsdb-aggregate-retention");
+        let retention_ms = 60_000;
         let max_bytes = 1_000_000;
-        let submission = signed_submission(&signing_key);
+        let now_ms = unix_time_ms();
+        let old_submission = signed_submission_at(&signing_key, now_ms.saturating_sub(120_000));
+        let fresh_submission = signed_submission_at(&signing_key, now_ms);
         let persistence = AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
-        let hub = Hub::with_store(allowlist.clone(), AggregateStore::new(), Some(persistence));
+        let hub = Hub::with_store(
+            allowlist_for(&signing_key),
+            AggregateStore::new(),
+            Some(persistence),
+        );
 
-        hub.submit(&serde_json::to_vec(&submission).unwrap())
+        hub.submit(&serde_json::to_vec(&old_submission).unwrap())
             .unwrap();
-        {
-            let mut log = fs::OpenOptions::new()
-                .append(true)
-                .open(dir.join("submissions.ndjson"))
-                .unwrap();
-            log.write_all(b"\n\0\0\0").unwrap();
-        }
-
-        let restored_persistence =
-            AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
-        let restored_store = restored_persistence.load_store(&allowlist).unwrap();
-        let restored_hub = Hub::with_store(allowlist, restored_store, Some(restored_persistence));
-        let replay = restored_hub
-            .submit(&serde_json::to_vec(&submission).unwrap())
+        hub.submit(&serde_json::to_vec(&fresh_submission).unwrap())
             .unwrap();
-        let log = fs::read(dir.join("submissions.ndjson")).unwrap();
+        let status = hub.status_json();
 
-        assert!(replay.duplicate);
-        assert!(!log.contains(&0));
-
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn persistence_rejects_complete_invalid_journal_line() {
-        let signing_key = sample_signing_key();
-        let allowlist = allowlist_for(&signing_key);
-        let dir = temp_test_dir("rsdb-aggregate-invalid-journal");
-        let retention_ms = 24 * 60 * 60 * 1_000;
-        let max_bytes = 1_000_000;
-        let submission = signed_submission(&signing_key);
-        let persistence = AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
-        let hub = Hub::with_store(allowlist.clone(), AggregateStore::new(), Some(persistence));
-
-        hub.submit(&serde_json::to_vec(&submission).unwrap())
-            .unwrap();
-        fs::OpenOptions::new()
-            .append(true)
-            .open(dir.join("submissions.ndjson"))
-            .unwrap()
-            .write_all(b"not-json\n")
-            .unwrap();
-
-        let restored_persistence =
-            AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
-        let error = restored_persistence.load_store(&allowlist).unwrap_err();
-
-        assert!(error.contains("invalid signed submission JSON"));
+        assert_eq!(
+            stored_submission_count(&dir, &old_submission.submission_id),
+            0
+        );
+        assert_eq!(
+            stored_submission_count(&dir, &fresh_submission.submission_id),
+            1
+        );
+        assert_eq!(status.persistence.log_records, Some(1));
+        assert!(status.persistence.compactions >= 1);
 
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1699,6 +1675,21 @@ mod tests {
 
         assert_eq!(&frame[..2], &[0x81, 5]);
         assert_eq!(&frame[2..], b"hello");
+    }
+
+    fn stored_submission_count(dir: &Path, submission_id: &str) -> i64 {
+        let connection = Connection::open(dir.join("aggregate.sqlite3")).unwrap();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM submissions WHERE submission_id = ?1",
+                [submission_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn submission_body_bytes(submission: &SignedSubmission) -> u64 {
+        u64::try_from(submission_body_json(submission).unwrap().len()).unwrap()
     }
 
     fn signed_submission(signing_key: &SigningKey) -> SignedSubmission {

@@ -111,6 +111,11 @@ RSDB_AGGREGATE_HOT_MAX_MB=250
 `RSDB_ALLOWLIST` can be a path or an inline list of public Ed25519 keys. Public
 allowlists can live in repo config or environment variables.
 
+`RSDB_AGGREGATE_DATA_DIR` stores the aggregate SQLite database. The retention
+window and hot max control how many accepted submissions remain in hot storage;
+the max is measured against the logical JSON submission bytes stored in SQLite.
+After pruning, SQLite reuses freed pages and attempts incremental vacuuming.
+
 `PORT` is treated as `RSDB_AGGREGATE_PORT` when `RSDB_AGGREGATE_PORT` is not
 set, which is useful on container platforms.
 

@@ -180,7 +180,8 @@ Raw-frame submissions wrap multiple decoded records under one receiver:
 ```
 
 The aggregate validates the batch schema, receiver ID, protocol, record
-metadata, and sequence fields before appending the accepted submission to disk.
+metadata, and sequence fields before inserting the accepted submission into
+SQLite.
 It keeps decoder state per receiver, so frame records split across submissions
 can still combine into aircraft positions. Decoded aircraft updates from the
 batch are broadcast as normal `FeedMessage` values on `/ws`.
