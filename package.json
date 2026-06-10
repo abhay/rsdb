@@ -9,7 +9,6 @@
     "hooks:install": "lefthook install"
   },
   "dependencies": {
-    "maplibre-gl": "4.7.1",
     "preact": "^10.29.2"
   },
   "devDependencies": {
