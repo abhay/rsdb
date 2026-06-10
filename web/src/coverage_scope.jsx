@@ -1,4 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { Deck, OrbitView, COORDINATE_SYSTEM } from "@deck.gl/core";
+import {
+  BitmapLayer,
+  IconLayer,
+  LineLayer,
+  PathLayer,
+  PointCloudLayer,
+  ScatterplotLayer,
+  TextLayer,
+} from "@deck.gl/layers";
+import { SimpleMeshLayer } from "@deck.gl/mesh-layers";
 
 // ----------------------------------------------------------------------
 // Constants
@@ -622,7 +633,7 @@ function envelopeRangeAt(profileData, altFt) {
 
 // ----------------------------------------------------------------------
 // CoverageScope — the whole deck.gl visualization as a Preact component.
-// deck.gl is read only as window.deck (CDN UMD global); never imported.
+// deck.gl is imported from @deck.gl/* and bundled into app.js by `bun build`.
 // ----------------------------------------------------------------------
 export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
   const containerRef = useRef(null);
@@ -758,13 +769,10 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
   }, [items, trails, dataTick]);
 
   // ------------------------------------------------------------------
-  // Mount the single deck.DeckGL instance. Cleanup finalizes the GL context.
+  // Mount the single Deck instance. Cleanup finalizes the GL context.
   // ------------------------------------------------------------------
   useEffect(() => {
-    const deck = window.deck;
-    if (!deck || !deck.DeckGL) return undefined;
-
-    const orbitView = new deck.OrbitView({
+    const orbitView = new OrbitView({
       id: "orbit",
       orbitAxis: "Z",
       near: 0.1,
@@ -797,14 +805,11 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     let raf = 0;
     let cancelled = false;
 
-    // Mount via the scripting wrapper's `container:` option: deck creates its
-    // OWN canvas inside this element and wires the OrbitView controller's
-    // drag/zoom handling to it. `parent:` is ignored by the scripting DeckGL
-    // (it escapes to a window-sized canvas on <html>); BYO `canvas:` stays in
-    // place but does NOT get the controller interaction (drag won't orbit).
-    // `container:` gives both: contained in the panel AND fully interactive.
-    // Defer until the host has a resolved, non-zero size so deck's initial
-    // canvas dimensions match the panel.
+    // Mount into the host element via `parent:`. The bundled @deck.gl/core
+    // `Deck` creates its own <canvas> inside `el` and wires the OrbitView
+    // controller (drag to orbit, scroll to zoom) to it, so the scene stays in
+    // the center panel and stays interactive. Defer until the host has a
+    // resolved, non-zero size so deck's initial canvas dimensions match it.
     const mount = () => {
       if (cancelled) return;
       const el = containerRef.current;
@@ -812,8 +817,8 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
         raf = requestAnimationFrame(mount);
         return;
       }
-      deckRef.current = new deck.DeckGL({
-        container: el,
+      deckRef.current = new Deck({
+        parent: el,
         views: [orbitView],
         initialViewState: initialViewState,
         controller: true,
@@ -838,19 +843,18 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
   // the Deck — only setProps({ layers }).
   // ------------------------------------------------------------------
   useEffect(() => {
-    const deck = window.deck;
     const instance = deckRef.current;
     const acc = accRef.current;
-    if (!deck || !instance || !acc) return;
+    if (!instance || !acc) return;
 
-    const CARTESIAN = deck.COORDINATE_SYSTEM.CARTESIAN;
+    const CARTESIAN = COORDINATE_SYSTEM.CARTESIAN;
     const topZ = 14 * exag;
     const layers = [];
 
     // Basemap mosaic (flat slippy z8 tiles -> ENU bounds). Bottom of the stack.
     if (visible.basemap) {
       for (const t of acc.tiles) {
-        layers.push(new deck.BitmapLayer({
+        layers.push(new BitmapLayer({
           id: t.id,
           image: t.url,
           bounds: t.bounds,
@@ -863,7 +867,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     }
 
     // Ground grid — faint LineLayer + brighter axes.
-    layers.push(new deck.LineLayer({
+    layers.push(new LineLayer({
       id: "grid",
       data: gridLines,
       coordinateSystem: CARTESIAN,
@@ -876,7 +880,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
       visible: visible.grid,
       parameters: { depthTest: true },
     }));
-    layers.push(new deck.LineLayer({
+    layers.push(new LineLayer({
       id: "grid-axes",
       data: axisLines,
       coordinateSystem: CARTESIAN,
@@ -891,7 +895,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     }));
 
     // Range rings — PathLayer on the ground plane.
-    layers.push(new deck.PathLayer({
+    layers.push(new PathLayer({
       id: "rings",
       data: rings,
       coordinateSystem: CARTESIAN,
@@ -906,7 +910,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     }));
 
     // Ring labels + cardinals — billboard TextLayer.
-    layers.push(new deck.TextLayer({
+    layers.push(new TextLayer({
       id: "labels",
       data: allTextLabels,
       coordinateSystem: CARTESIAN,
@@ -927,7 +931,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     if (visible.hull) {
       const hullMesh = buildHullMesh(acc, exag, hullIndicesRef);
       if (hullMesh) {
-        layers.push(new deck.SimpleMeshLayer({
+        layers.push(new SimpleMeshLayer({
           id: "hull",
           data: SINGLE_INSTANCE,
           mesh: hullMesh,
@@ -946,7 +950,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
 
     // Coverage cloud (THE CONE) — PointCloudLayer, binary typed-array form.
     const coverageBinary = buildCoverageBinary(acc, exag);
-    layers.push(new deck.PointCloudLayer({
+    layers.push(new PointCloudLayer({
       id: "coverage",
       data: coverageBinary,
       coordinateSystem: CARTESIAN,
@@ -959,7 +963,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     }));
 
     // Station marker — vertical reference LineLayer + bright origin dot.
-    layers.push(new deck.LineLayer({
+    layers.push(new LineLayer({
       id: "station-line",
       data: [{ s: [0, 0, 0], t: [0, 0, topZ] }],
       coordinateSystem: CARTESIAN,
@@ -972,7 +976,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
       updateTriggers: { getTargetPosition: exag },
       parameters: { depthTest: true },
     }));
-    layers.push(new deck.ScatterplotLayer({
+    layers.push(new ScatterplotLayer({
       id: "station-dot",
       data: [{ p: [0, 0, 0] }],
       coordinateSystem: CARTESIAN,
@@ -988,7 +992,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     }));
 
     // Motion trails — PathLayer (drawn before planes).
-    layers.push(new deck.PathLayer({
+    layers.push(new PathLayer({
       id: "trails",
       data: liveData,
       coordinateSystem: CARTESIAN,
@@ -1005,7 +1009,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     }));
 
     // Altitude drop-lines — LineLayer (depth cue, just under planes).
-    layers.push(new deck.LineLayer({
+    layers.push(new LineLayer({
       id: "droplines",
       data: liveData,
       coordinateSystem: CARTESIAN,
@@ -1023,7 +1027,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     // Live planes — 3D models (default) or flat icon.
     if (visible.planes) {
       if (planeStyle === "icon") {
-        layers.push(new deck.IconLayer({
+        layers.push(new IconLayer({
           id: "planes",
           data: liveData,
           coordinateSystem: CARTESIAN,
@@ -1055,8 +1059,8 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
           parameters: { depthTest: true },
           updateTriggers: { getPosition: [exag, dataTick], getColor: dataTick, getOrientation: dataTick },
         };
-        layers.push(new deck.SimpleMeshLayer(Object.assign({ id: "planes-model-air", data: air, mesh: AIRPLANE_MESH }, common)));
-        layers.push(new deck.SimpleMeshLayer(Object.assign({ id: "planes-model-heli", data: heli, mesh: HELICOPTER_MESH }, common)));
+        layers.push(new SimpleMeshLayer(Object.assign({ id: "planes-model-air", data: air, mesh: AIRPLANE_MESH }, common)));
+        layers.push(new SimpleMeshLayer(Object.assign({ id: "planes-model-heli", data: heli, mesh: HELICOPTER_MESH }, common)));
       }
     }
 
