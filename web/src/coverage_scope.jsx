@@ -792,7 +792,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
     };
 
     const instance = new deck.DeckGL({
-      parent: containerRef.current,
+      canvas: containerRef.current,
       views: [orbitView],
       initialViewState: initialViewState,
       controller: true,
@@ -1267,12 +1267,17 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
       <div className="scope-head">
         <div>
           <span className="eyebrow">Scope</span>
-          <h2>Coverage</h2>
-          <p className="scope-summary">{positionedCount} positioned / {liveCount} live</p>
+          <div className="scope-title-row">
+            <h2>Coverage</h2>
+            <span className="cs-ephemeral-badge" title="Coverage, hull, slice, and profile accumulate in this browser session from the live feed. They are not yet persisted to or replayed from the submission store, so they reset on reload.">
+              session data
+            </span>
+          </div>
+          <p className="scope-summary">{positionedCount} positioned / {liveCount} live &middot; ephemeral, not yet wired to the submission store</p>
         </div>
       </div>
       <div className="cs-deck-wrap">
-        <div ref={containerRef} className="cs-deck" aria-label="Live coverage visualization" />
+        <canvas ref={containerRef} className="cs-deck" aria-label="Live coverage visualization" />
 
         {/* Controls (top-right) */}
         <div className="cs-overlay cs-controls">
