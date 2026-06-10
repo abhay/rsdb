@@ -101,6 +101,9 @@ impl SubmissionSigner {
                 payload_receiver_id: payload_receiver.id.clone(),
             });
         }
+        payload
+            .validate()
+            .map_err(SubmissionSigningError::InvalidPayload)?;
 
         let mut submission = SignedSubmission::new_ed25519(
             self.receiver_id.clone(),
@@ -114,6 +117,20 @@ impl SubmissionSigner {
                 .map_err(|error| SubmissionSigningError::Serialization(error.to_string()))?,
         );
         submission.signature = encode_hex(&signature.to_bytes());
+        submission
+            .validate_envelope()
+            .map_err(|error| SubmissionSigningError::InternalVerification(error.to_string()))?;
+        verify_ed25519(&submission, &self.signing_key.verifying_key().to_bytes())
+            .map_err(|error| SubmissionSigningError::InternalVerification(error.to_string()))?;
+        let encoded = serde_json::to_vec(&submission)
+            .map_err(|error| SubmissionSigningError::Serialization(error.to_string()))?;
+        let decoded = serde_json::from_slice::<SignedSubmission>(&encoded)
+            .map_err(|error| SubmissionSigningError::Serialization(error.to_string()))?;
+        decoded
+            .validate_envelope()
+            .map_err(|error| SubmissionSigningError::InternalVerification(error.to_string()))?;
+        verify_ed25519(&decoded, &self.signing_key.verifying_key().to_bytes())
+            .map_err(|error| SubmissionSigningError::InternalVerification(error.to_string()))?;
 
         Ok(submission)
     }
@@ -267,24 +284,22 @@ impl SignedSubmission {
     ) -> Self {
         let algorithm = SignatureAlgorithm::Ed25519;
         let payload = payload.into();
-        let submission_id = submission_id_for(
-            SIGNED_SUBMISSION_SCHEMA_VERSION,
-            &receiver_id,
-            algorithm,
-            submitted_at_ms,
-            &payload,
-        )
-        .expect("submission payload serialization cannot fail");
-
-        Self {
+        let submission = Self {
             schema_version: SIGNED_SUBMISSION_SCHEMA_VERSION,
-            submission_id,
+            submission_id: String::new(),
             receiver_id,
             algorithm,
             submitted_at_ms,
             payload,
             signature,
-        }
+        };
+        let mut submission = submission
+            .wire_canonicalized()
+            .expect("submission payload serialization cannot fail");
+        submission.submission_id = submission
+            .expected_submission_id()
+            .expect("submission payload serialization cannot fail");
+        submission
     }
 
     /// Returns the canonical JSON bytes covered by `signature`.
@@ -297,6 +312,56 @@ impl SignedSubmission {
             .map_err(|error| SubmissionVerificationError::Serialization(error.to_string()))
     }
 
+    /// Validates all deterministic envelope fields that do not require a public key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when schema versions are unsupported, receiver identity
+    /// does not match, payload validation fails, or the submission ID no longer
+    /// matches the current payload.
+    pub fn validate_envelope(&self) -> Result<(), SubmissionVerificationError> {
+        if self.schema_version != SIGNED_SUBMISSION_SCHEMA_VERSION {
+            return Err(SubmissionVerificationError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                expected: SIGNED_SUBMISSION_SCHEMA_VERSION,
+            });
+        }
+        if !self.payload.is_supported_schema_version() {
+            return Err(
+                SubmissionVerificationError::UnsupportedPayloadSchemaVersion {
+                    actual: self.payload.schema_version(),
+                    expected: self.payload.expected_schema_version(),
+                },
+            );
+        }
+        self.payload
+            .validate()
+            .map_err(SubmissionVerificationError::InvalidPayload)?;
+
+        let payload_receiver = self
+            .payload
+            .receiver()
+            .ok_or(SubmissionVerificationError::MissingPayloadReceiver)?;
+        if payload_receiver.id != self.receiver_id {
+            return Err(SubmissionVerificationError::ReceiverMismatch {
+                envelope_receiver_id: self.receiver_id.clone(),
+                payload_receiver_id: payload_receiver.id.clone(),
+            });
+        }
+
+        let expected_submission_id = self
+            .expected_submission_id()
+            .map_err(|error| SubmissionVerificationError::Serialization(error.to_string()))?;
+        if self.submission_id != expected_submission_id {
+            return Err(SubmissionVerificationError::SubmissionIdMismatch {
+                submission_id: self.submission_id.clone(),
+                expected_submission_id,
+            });
+        }
+
+        Ok(())
+    }
+
     fn signing_payload(&self) -> SubmissionSigningPayload<'_> {
         SubmissionSigningPayload {
             schema_version: self.schema_version,
@@ -306,6 +371,10 @@ impl SignedSubmission {
             submitted_at_ms: self.submitted_at_ms,
             payload: &self.payload,
         }
+    }
+
+    fn wire_canonicalized(&self) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(&serde_json::to_vec(self)?)
     }
 }
 
@@ -345,47 +414,10 @@ impl ReceiverAllowlist {
         &self,
         submission: &SignedSubmission,
     ) -> Result<(), SubmissionVerificationError> {
-        if submission.schema_version != SIGNED_SUBMISSION_SCHEMA_VERSION {
-            return Err(SubmissionVerificationError::UnsupportedSchemaVersion {
-                actual: submission.schema_version,
-                expected: SIGNED_SUBMISSION_SCHEMA_VERSION,
-            });
-        }
-        if !submission.payload.is_supported_schema_version() {
-            return Err(
-                SubmissionVerificationError::UnsupportedPayloadSchemaVersion {
-                    actual: submission.payload.schema_version(),
-                    expected: submission.payload.expected_schema_version(),
-                },
-            );
-        }
-        submission
-            .payload
-            .validate()
-            .map_err(SubmissionVerificationError::InvalidPayload)?;
-
-        let payload_receiver = submission
-            .payload
-            .receiver()
-            .ok_or(SubmissionVerificationError::MissingPayloadReceiver)?;
-        if payload_receiver.id != submission.receiver_id {
-            return Err(SubmissionVerificationError::ReceiverMismatch {
-                envelope_receiver_id: submission.receiver_id.clone(),
-                payload_receiver_id: payload_receiver.id.clone(),
-            });
-        }
+        submission.validate_envelope()?;
 
         let public_key = self.allowed_ed25519_public_key(&submission.receiver_id)?;
         verify_ed25519(submission, &public_key)?;
-        let expected_submission_id = submission
-            .expected_submission_id()
-            .map_err(|error| SubmissionVerificationError::Serialization(error.to_string()))?;
-        if submission.submission_id != expected_submission_id {
-            return Err(SubmissionVerificationError::SubmissionIdMismatch {
-                submission_id: submission.submission_id.clone(),
-                expected_submission_id,
-            });
-        }
 
         Ok(())
     }
@@ -452,6 +484,8 @@ pub enum SubmissionSigningError {
         signer_receiver_id: String,
         payload_receiver_id: String,
     },
+    InvalidPayload(String),
+    InternalVerification(String),
     Serialization(String),
 }
 
@@ -470,6 +504,13 @@ impl fmt::Display for SubmissionSigningError {
                 formatter,
                 "payload receiver_id {payload_receiver_id} does not match signer receiver_id {signer_receiver_id}"
             ),
+            Self::InvalidPayload(error) => write!(formatter, "invalid submission payload: {error}"),
+            Self::InternalVerification(error) => {
+                write!(
+                    formatter,
+                    "signed submission failed self-verification: {error}"
+                )
+            }
             Self::Serialization(error) => {
                 write!(formatter, "failed to serialize signing payload: {error}")
             }
@@ -735,6 +776,59 @@ mod tests {
     }
 
     #[test]
+    fn verifies_serialized_enriched_frame_record_batch() {
+        let signer = SubmissionSigner::from_ed25519_secret_hex(
+            "0707070707070707070707070707070707070707070707070707070707070707",
+        )
+        .unwrap();
+        let receiver = ReceiverIdentity::new(signer.receiver_id().to_owned());
+        let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+        let mut record =
+            FrameRecord::new(42, 31_884_418, &frame).with_receiver(Some(receiver.clone()));
+        record.frame_sequence = Some(7);
+        record.stream_start_ms = Some(1);
+        record.gain_mode = Some("manual".to_owned());
+        record.gain_tenth_db = Some(496);
+        record.bias_t = Some(false);
+        record.device_index = Some(0);
+        record.tuner_name = Some("R820T".to_owned());
+        record.stream_id = Some("adsb1090-1".to_owned());
+        record.chunk_sequence = Some(3);
+        record.chunk_sample_index = Some(32768);
+        record.set_dropped_samples_before(0);
+        record.clipped_sample_ratio = Some(0.0);
+        record.dc_i_offset = Some(-0.5);
+        record.dc_q_offset = Some(0.25);
+        let batch = FrameRecordBatch::new(Protocol::Adsb1090, receiver, vec![record]);
+        let submission = signer.sign_frame_records(batch, 1_717_000_000_000).unwrap();
+        let encoded = serde_json::to_string(&submission).unwrap();
+        let decoded = serde_json::from_str::<SignedSubmission>(&encoded).unwrap();
+        let allowlist = ReceiverAllowlist::new(vec![signer.public_key_hex()]);
+
+        assert_eq!(allowlist.verify_submission(&decoded), Ok(()));
+    }
+
+    #[test]
+    fn signing_rejects_non_finite_frame_record_metrics() {
+        let signer = SubmissionSigner::from_ed25519_secret_hex(
+            "0707070707070707070707070707070707070707070707070707070707070707",
+        )
+        .unwrap();
+        let receiver = ReceiverIdentity::new(signer.receiver_id().to_owned());
+        let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+        let mut record =
+            FrameRecord::new(42, 31_884_418, &frame).with_receiver(Some(receiver.clone()));
+        record.clipped_sample_ratio = Some(f64::NAN);
+        let batch = FrameRecordBatch::new(Protocol::Adsb1090, receiver, vec![record]);
+
+        let error = signer
+            .sign_frame_records(batch, 1_717_000_000_000)
+            .unwrap_err();
+
+        assert!(matches!(error, SubmissionSigningError::InvalidPayload(_)));
+    }
+
+    #[test]
     fn derives_receiver_id_from_secret_key() {
         let first = receiver_id_from_ed25519_secret_hex(
             "0707070707070707070707070707070707070707070707070707070707070707",
@@ -792,12 +886,10 @@ mod tests {
             *now_ms += 1;
         }
 
-        assert_eq!(
+        assert!(matches!(
             allowlist.verify_submission(&submission),
-            Err(SubmissionVerificationError::SignatureMismatch {
-                receiver_id: sample_receiver_id(),
-            })
-        );
+            Err(SubmissionVerificationError::SubmissionIdMismatch { .. })
+        ));
     }
 
     #[test]
@@ -808,12 +900,10 @@ mod tests {
 
         submission.submission_id = "0".repeat(64);
 
-        assert_eq!(
+        assert!(matches!(
             allowlist.verify_submission(&submission),
-            Err(SubmissionVerificationError::SignatureMismatch {
-                receiver_id: sample_receiver_id(),
-            })
-        );
+            Err(SubmissionVerificationError::SubmissionIdMismatch { .. })
+        ));
     }
 
     #[test]

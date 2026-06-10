@@ -13,7 +13,7 @@ work, but those live decoders still need to be built.
 
 | Binary | Role | Typical host |
 | --- | --- | --- |
-| `rsdb-usb` | Opens the RTL-SDR, decodes the configured radio stream, signs feed messages, and serves local receiver diagnostics. | Raspberry Pi attached to the SDR |
+| `rsdb-usb` | Opens the RTL-SDR, decodes the configured radio stream, signs frame batches and heartbeats, and serves local receiver diagnostics. | Raspberry Pi attached to the SDR |
 | `rsdb-aggregate` | Verifies signed submissions, dedupes by submission ID, persists hot aggregate state, and serves the public UI/API/WebSocket feed. | Same Pi, Fly.io, or another server |
 
 On a single Pi, both binaries run as managed services. The receiver submits to

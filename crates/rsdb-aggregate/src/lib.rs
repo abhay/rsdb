@@ -20,6 +20,7 @@ const APP_CSS: &str = include_str!("../../../web/static/app.css");
 const APP_JS: &str = include_str!("../../../web/dist/app.js");
 const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 const AGGREGATE_CHECKPOINT_RECORDS: u64 = 250;
+const AGGREGATE_COMPACTION_TARGET_PERCENT: u64 = 80;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -750,8 +751,13 @@ impl AggregatePersistence {
         let mut retained_bytes = entries
             .iter()
             .fold(0_u64, |bytes, entry| bytes.saturating_add(entry.line_bytes));
+        let target_bytes = if retained_bytes > self.max_bytes {
+            compaction_target_bytes(self.max_bytes)
+        } else {
+            self.max_bytes
+        };
         let mut first_retained = 0_usize;
-        while retained_bytes > self.max_bytes && first_retained + 1 < entries.len() {
+        while retained_bytes > target_bytes && first_retained + 1 < entries.len() {
             retained_bytes = retained_bytes.saturating_sub(entries[first_retained].line_bytes);
             first_retained += 1;
         }
@@ -922,6 +928,13 @@ fn retained_submission_ids(submissions: &[SubmissionLogEntry]) -> BTreeSet<Strin
         .iter()
         .map(|entry| entry.submission.submission_id.clone())
         .collect()
+}
+
+fn compaction_target_bytes(max_bytes: u64) -> u64 {
+    max_bytes
+        .saturating_mul(AGGREGATE_COMPACTION_TARGET_PERCENT)
+        .saturating_div(100)
+        .max(1)
 }
 
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
@@ -1522,6 +1535,46 @@ mod tests {
             .unwrap();
 
         assert!(replay.duplicate);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistence_compaction_leaves_space_before_next_compaction() {
+        let signing_key = sample_signing_key();
+        let dir = temp_test_dir("rsdb-aggregate-compaction-target");
+        let retention_ms = 60 * 60 * 1_000;
+        let now_ms = unix_time_ms();
+        let submissions = (0..6)
+            .map(|offset| signed_submission_at(&signing_key, now_ms + offset))
+            .collect::<Vec<_>>();
+        let max_line_bytes = submissions
+            .iter()
+            .map(|submission| submission_line_bytes(submission).unwrap())
+            .max()
+            .unwrap();
+        let max_bytes = max_line_bytes * 3;
+        let persistence = AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
+        let hub = Hub::with_store(
+            allowlist_for(&signing_key),
+            AggregateStore::new(),
+            Some(persistence),
+        );
+
+        for submission in &submissions {
+            hub.submit(&serde_json::to_vec(submission).unwrap())
+                .unwrap();
+        }
+
+        let status = hub.status_json();
+
+        assert!(status.persistence.compactions >= 1);
+        assert!(
+            status
+                .persistence
+                .log_bytes
+                .is_some_and(|bytes| bytes <= compaction_target_bytes(max_bytes))
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }

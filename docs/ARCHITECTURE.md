@@ -3,9 +3,9 @@
 RSDB splits hardware collection from public serving.
 
 `rsdb-usb` is the hardware-adjacent receiver process. It opens the RTL-SDR,
-runs 1 configured radio job, maintains local receiver diagnostics, signs feed
-messages when a receiver seed is configured, and retries submissions through a
-durable local outbox.
+runs 1 configured radio job, maintains local receiver diagnostics, signs raw
+frame batches and heartbeat messages when a receiver seed is configured, and
+retries submissions through a durable local outbox.
 
 `rsdb-aggregate` is the public data product. It verifies signed submissions,
 dedupes by submission ID, owns aggregate state through a single writer, persists
@@ -43,7 +43,8 @@ rsdb-usb
     |
     +-- local diagnostics API
     |
-    +-- protocol-tagged FeedMessage
+    +-- signed FrameRecordBatch aircraft data
+    +-- signed heartbeat FeedMessage health data
            |
            v
        submission worker
@@ -79,7 +80,8 @@ sequenceDiagram
   USB->>R: IQ sample stream
   R->>R: demodulate configured protocol
   R->>R: update local receiver state
-  R->>Q: signed FeedMessage or FrameRecordBatch
+  R->>Q: signed FrameRecordBatch aircraft data
+  R->>Q: signed heartbeat FeedMessage health data
   Q->>A: POST /submit
   A->>A: verify allowlist and signature
   A->>A: enqueue to single aggregate writer
@@ -101,13 +103,13 @@ sequenceDiagram
 1. USB sends I/Q samples to rsdb-usb.
 2. The receiver decodes the configured protocol into protocol-tagged feed updates and frame records.
 3. The receiver updates its local diagnostic state.
-4. The submission worker signs each payload as a SignedSubmission.
+4. The submission worker signs frame batches for aircraft data and heartbeat messages for receiver health.
 5. The worker appends submissions to the durable outbox.
 6. The worker POSTs queued submissions to each configured aggregate /submit.
 7. The aggregate verifies the allowlist and signature.
 8. The HTTP worker queues the verified submission to the single writer.
 9. The writer dedupes submission_id and appends accepted submissions to disk.
-10. The writer updates receiver-scoped state and broadcasts live FeedMessage updates.
+10. The writer decodes frame batches into receiver-scoped state and broadcasts live FeedMessage updates.
 11. Browser/API clients bootstrap from HTTP JSON, then use WebSocket for live updates.
 ```
 

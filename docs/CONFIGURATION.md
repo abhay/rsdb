@@ -94,6 +94,8 @@ RSDB_SUBMIT_URLS='http://127.0.0.1:8090,https://rsdb.hackshare.com'
 
 The outbox is durable. If an aggregate is unavailable, signed submissions remain
 queued and replay later. Submission IDs make replay idempotent at the aggregate.
+Aircraft data is submitted as signed frame batches; receiver health is submitted
+as signed heartbeat feed messages.
 
 ## Aggregate Service
 

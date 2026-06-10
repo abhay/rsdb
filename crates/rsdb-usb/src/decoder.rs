@@ -1,29 +1,40 @@
 use std::time::Instant;
 
 use rsdb::{
-    AircraftSnapshot, AircraftStore, FeedMessage, FeedStats, ModesFrameDecoder, Protocol,
-    ReceiverIdentity, SubmissionStatus, enrich_aircraft_snapshot, enrich_aircraft_snapshots,
+    AircraftSnapshot, AircraftStore, FeedMessage, FeedStats, FrameRecord, FrameRecordBatch,
+    ModesFrameDecoder, Protocol, RadioConfig, ReceiverIdentity, SubmissionStatus,
+    enrich_aircraft_snapshot, enrich_aircraft_snapshots, iq_chunk_metrics,
 };
 
 use crate::config::FeedRuntimeConfig;
-use crate::usb::{IqStream, RtlSdrConfig, RtlSdrSource};
+use crate::usb::{GainMode, IqStream, RtlSdrConfig, RtlSdrSource};
 
 pub(crate) fn run_feed(
     config: RtlSdrConfig,
     feed_config: &FeedRuntimeConfig,
     seconds: Option<u64>,
     mut publish: impl FnMut(FeedMessage) -> Result<(), String>,
+    mut submit_frame_batch: impl FnMut(FrameRecordBatch) -> Result<(), String>,
     mut observe_stream: impl FnMut(&IqStream, FeedCounters) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut source = RtlSdrSource::open(config).map_err(|error| error.to_string())?;
+    let radio = RadioConfig::for_protocol(config.protocol)
+        .with_center_frequency_hz(source.center_frequency_hz())
+        .with_sample_rate_hz(source.sample_rate_hz());
+    let source_metadata = FrameRecordSourceMetadata::new(config, source.tuner_name())?;
     let stream = source
         .start_streaming()
         .map_err(|error| error.to_string())?;
     let result = run_streaming_feed(
         &stream,
-        feed_config,
+        StreamingFeedContext {
+            feed_config,
+            radio,
+            source_metadata,
+        },
         seconds,
         &mut publish,
+        &mut submit_frame_batch,
         &mut observe_stream,
     );
 
@@ -33,14 +44,35 @@ pub(crate) fn run_feed(
 
 fn run_streaming_feed(
     stream: &IqStream,
-    feed_config: &FeedRuntimeConfig,
+    context: StreamingFeedContext<'_>,
     seconds: Option<u64>,
     publish: &mut impl FnMut(FeedMessage) -> Result<(), String>,
+    submit_frame_batch: &mut impl FnMut(FrameRecordBatch) -> Result<(), String>,
     observe_stream: &mut impl FnMut(&IqStream, FeedCounters) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut decoder = FeedDecoderKind::for_protocol(feed_config.radio.protocol, "feed")?
-        .build_decoder(feed_config);
-    run_streaming_feed_with_decoder(stream, &mut decoder, seconds, publish, observe_stream)
+    let stream_start_ms = crate::unix_time_ms();
+    let mut decoder = FeedDecoderKind::for_protocol(context.feed_config.radio.protocol, "feed")?
+        .build_decoder(
+            context.feed_config,
+            context.radio,
+            context.source_metadata,
+            stream_start_ms,
+        );
+    run_streaming_feed_with_decoder(
+        stream,
+        &mut decoder,
+        seconds,
+        publish,
+        submit_frame_batch,
+        observe_stream,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct StreamingFeedContext<'a> {
+    feed_config: &'a FeedRuntimeConfig,
+    radio: RadioConfig,
+    source_metadata: FrameRecordSourceMetadata,
 }
 
 fn run_streaming_feed_with_decoder(
@@ -48,6 +80,7 @@ fn run_streaming_feed_with_decoder(
     decoder: &mut impl RadioFeedDecoder,
     seconds: Option<u64>,
     publish: &mut impl FnMut(FeedMessage) -> Result<(), String>,
+    submit_frame_batch: &mut impl FnMut(FrameRecordBatch) -> Result<(), String>,
     observe_stream: &mut impl FnMut(&IqStream, FeedCounters) -> Result<(), String>,
 ) -> Result<(), String> {
     let start = Instant::now();
@@ -63,9 +96,14 @@ fn run_streaming_feed_with_decoder(
         };
 
         counters.record_usb_chunk(data.len(), crate::unix_time_ms());
+        counters.dropped_usb_chunks = stream.dropped_chunks();
 
-        for message in decoder.decode_chunk(&data, &mut counters) {
+        let output = decoder.decode_chunk(&data, stream.dropped_chunks(), &mut counters)?;
+        for message in output.messages {
             publish(message)?;
+        }
+        if let Some(batch) = output.frame_batch {
+            submit_frame_batch(batch)?;
         }
 
         counters.dropped_usb_chunks = stream.dropped_chunks();
@@ -86,7 +124,12 @@ fn run_streaming_feed_with_decoder(
 trait RadioFeedDecoder {
     fn initial_snapshot(&self, now_ms: u64) -> FeedMessage;
 
-    fn decode_chunk(&mut self, data: &[u8], counters: &mut FeedCounters) -> Vec<FeedMessage>;
+    fn decode_chunk(
+        &mut self,
+        data: &[u8],
+        dropped_chunks: u64,
+        counters: &mut FeedCounters,
+    ) -> Result<FeedChunkOutput, String>;
 
     fn housekeeping_messages(
         &mut self,
@@ -95,6 +138,12 @@ trait RadioFeedDecoder {
         counters: &mut FeedCounters,
         last_heartbeat_ms: &mut u64,
     ) -> Vec<FeedMessage>;
+}
+
+#[derive(Debug, Default)]
+struct FeedChunkOutput {
+    messages: Vec<FeedMessage>,
+    frame_batch: Option<FrameRecordBatch>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -111,11 +160,20 @@ impl FeedDecoderKind {
         }
     }
 
-    fn build_decoder(self, feed_config: &FeedRuntimeConfig) -> ActiveFeedDecoder<'_> {
+    fn build_decoder(
+        self,
+        feed_config: &FeedRuntimeConfig,
+        radio: RadioConfig,
+        source_metadata: FrameRecordSourceMetadata,
+        stream_start_ms: u64,
+    ) -> ActiveFeedDecoder<'_> {
         match self {
-            Self::ModesAircraft => {
-                ActiveFeedDecoder::ModesAircraft(ModesAircraftFeedDecoder::new(feed_config))
-            }
+            Self::ModesAircraft => ActiveFeedDecoder::ModesAircraft(ModesAircraftFeedDecoder::new(
+                feed_config,
+                radio,
+                source_metadata,
+                stream_start_ms,
+            )),
         }
     }
 }
@@ -131,9 +189,14 @@ impl RadioFeedDecoder for ActiveFeedDecoder<'_> {
         }
     }
 
-    fn decode_chunk(&mut self, data: &[u8], counters: &mut FeedCounters) -> Vec<FeedMessage> {
+    fn decode_chunk(
+        &mut self,
+        data: &[u8],
+        dropped_chunks: u64,
+        counters: &mut FeedCounters,
+    ) -> Result<FeedChunkOutput, String> {
         match self {
-            Self::ModesAircraft(decoder) => decoder.decode_chunk(data, counters),
+            Self::ModesAircraft(decoder) => decoder.decode_chunk(data, dropped_chunks, counters),
         }
     }
 
@@ -173,18 +236,71 @@ impl FrameDecoderKind {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FrameRecordSourceMetadata {
+    gain_mode: String,
+    gain_tenth_db: Option<i32>,
+    bias_t: bool,
+    device_index: u64,
+    tuner_name: String,
+}
+
+impl FrameRecordSourceMetadata {
+    fn new(config: RtlSdrConfig, tuner_name: String) -> Result<Self, String> {
+        let device_index = u64::try_from(config.device_index)
+            .map_err(|_| "RTL-SDR device index overflowed u64".to_owned())?;
+        let (gain_mode, gain_tenth_db) = match config.gain {
+            GainMode::Auto => ("auto".to_owned(), None),
+            GainMode::Manual(gain_tenth_db) => ("manual".to_owned(), Some(gain_tenth_db)),
+        };
+
+        Ok(Self {
+            gain_mode,
+            gain_tenth_db,
+            bias_t: config.bias_t,
+            device_index,
+            tuner_name,
+        })
+    }
+}
+
 struct ModesAircraftFeedDecoder<'a> {
     feed_config: &'a FeedRuntimeConfig,
     frames: ModesFrameDecoder,
     store: AircraftStore,
+    radio: RadioConfig,
+    source_metadata: FrameRecordSourceMetadata,
+    stream_start_ms: u64,
+    stream_id: String,
+    frame_sequence: u64,
+    chunk_sequence: u64,
+    chunk_sample_index: u64,
+    dropped_chunks: u64,
+    dropped_samples_before: u64,
 }
 
 impl<'a> ModesAircraftFeedDecoder<'a> {
-    fn new(feed_config: &'a FeedRuntimeConfig) -> Self {
+    fn new(
+        feed_config: &'a FeedRuntimeConfig,
+        radio: RadioConfig,
+        source_metadata: FrameRecordSourceMetadata,
+        stream_start_ms: u64,
+    ) -> Self {
+        let stream_id = format!("{}-{stream_start_ms}", radio.protocol.key());
+
         Self {
             feed_config,
             frames: ModesFrameDecoder::default(),
             store: AircraftStore::default(),
+            radio,
+            source_metadata,
+            stream_start_ms,
+            stream_id,
+            frame_sequence: 0,
+            chunk_sequence: 0,
+            chunk_sample_index: 0,
+            dropped_chunks: 0,
+            dropped_samples_before: 0,
         }
     }
 
@@ -219,16 +335,59 @@ impl RadioFeedDecoder for ModesAircraftFeedDecoder<'_> {
         .with_receiver(self.receiver_identity())
     }
 
-    fn decode_chunk(&mut self, data: &[u8], counters: &mut FeedCounters) -> Vec<FeedMessage> {
+    fn decode_chunk(
+        &mut self,
+        data: &[u8],
+        dropped_chunks: u64,
+        counters: &mut FeedCounters,
+    ) -> Result<FeedChunkOutput, String> {
         let mut messages = Vec::new();
+        let mut records = Vec::new();
+        let chunk_samples = u64::try_from(data.len() / 2)
+            .map_err(|_| "USB chunk sample count overflowed u64".to_owned())?;
+        if dropped_chunks > self.dropped_chunks {
+            let missed_chunks = dropped_chunks - self.dropped_chunks;
+            self.dropped_samples_before = self
+                .dropped_samples_before
+                .saturating_add(missed_chunks.saturating_mul(chunk_samples));
+            self.dropped_chunks = dropped_chunks;
+        }
+        let chunk_metrics = iq_chunk_metrics(data);
 
         for decoded in self.frames.decode_chunk(data) {
             counters.decoded_frames += 1;
             let now_ms = crate::unix_time_ms();
+            let mut record = FrameRecord::from_decoded_frame(self.radio, now_ms, &decoded)
+                .map_err(|error| error.to_string())?;
+            record.frame_sequence = Some(self.frame_sequence);
+            record.stream_start_ms = Some(self.stream_start_ms);
+            record
+                .receiver
+                .clone_from(&self.feed_config.receiver_identity);
+            record
+                .receiver_site
+                .clone_from(&self.feed_config.receiver_site);
+            record.gain_mode = Some(self.source_metadata.gain_mode.clone());
+            record.gain_tenth_db = self.source_metadata.gain_tenth_db;
+            record.bias_t = Some(self.source_metadata.bias_t);
+            record.device_index = Some(self.source_metadata.device_index);
+            record.tuner_name = Some(self.source_metadata.tuner_name.clone());
+            record.stream_id = Some(self.stream_id.clone());
+            record.chunk_sequence = Some(self.chunk_sequence);
+            record.chunk_sample_index = Some(self.chunk_sample_index);
+            record.set_dropped_samples_before(self.dropped_samples_before);
+            if let Some(metrics) = chunk_metrics {
+                record.apply_iq_chunk_metrics(metrics);
+            }
+
             let Some(snapshot) = self.store.update_frame(&decoded.frame, now_ms) else {
+                records.push(record);
+                self.frame_sequence = self.frame_sequence.saturating_add(1);
                 continue;
             };
 
+            records.push(record);
+            self.frame_sequence = self.frame_sequence.saturating_add(1);
             counters.aircraft_updates += 1;
             counters.last_frame_ms = Some(now_ms);
             messages.push(
@@ -241,7 +400,23 @@ impl RadioFeedDecoder for ModesAircraftFeedDecoder<'_> {
             );
         }
 
-        messages
+        self.chunk_sample_index = self.chunk_sample_index.saturating_add(chunk_samples);
+        self.chunk_sequence = self.chunk_sequence.saturating_add(1);
+
+        let frame_batch = match (
+            records.is_empty(),
+            self.feed_config.receiver_identity.clone(),
+        ) {
+            (false, Some(receiver)) => {
+                Some(FrameRecordBatch::new(self.protocol(), receiver, records))
+            }
+            _ => None,
+        };
+
+        Ok(FeedChunkOutput {
+            messages,
+            frame_batch,
+        })
     }
 
     fn housekeeping_messages(

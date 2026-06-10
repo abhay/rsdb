@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 #[cfg(feature = "websocket")]
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -26,9 +26,9 @@ use rsdb::PendingSubmission;
 #[cfg(feature = "websocket")]
 use rsdb::SubmissionOutbox;
 use rsdb::{
-    AdsbMessage, ExtendedSquitter, FeedMessage, Frame, FrameRecord, FrameReplayConfig, RadioConfig,
-    ReceiverAllowlist, ReceiverIdentity, SignedSubmission, SubmissionSigner, SubmissionStatus,
-    iq_chunk_metrics, replay_frame_records,
+    AdsbMessage, ExtendedSquitter, FeedMessage, Frame, FrameRecord, FrameRecordBatch,
+    FrameReplayConfig, RadioConfig, ReceiverAllowlist, ReceiverIdentity, SignedSubmission,
+    SubmissionPayload, SubmissionSigner, SubmissionStatus, iq_chunk_metrics, replay_frame_records,
 };
 use usb::{GainMode, IqStream, RtlSdrConfig, RtlSdrSource, list_rtl_sdr_devices};
 
@@ -358,6 +358,7 @@ fn emit_json(
             );
             Ok(())
         },
+        |_| Ok(()),
         |_, _| Ok(()),
     )
 }
@@ -736,6 +737,52 @@ fn message_for_signing(
     }
 }
 
+#[cfg(feature = "websocket")]
+fn payload_for_signing(
+    payload: SubmissionPayload,
+    receiver_identity: &ReceiverIdentity,
+) -> Result<SubmissionPayload, String> {
+    match payload {
+        SubmissionPayload::FeedMessage(message) => {
+            validate_feed_schema(Path::new("receiver"), 0, message)
+                .and_then(|message| message_for_signing(message, receiver_identity))
+                .map(SubmissionPayload::FeedMessage)
+        }
+        SubmissionPayload::FrameRecords(batch) => {
+            frame_batch_for_signing(batch, receiver_identity).map(SubmissionPayload::FrameRecords)
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+fn frame_batch_for_signing(
+    mut batch: FrameRecordBatch,
+    receiver_identity: &ReceiverIdentity,
+) -> Result<FrameRecordBatch, String> {
+    if batch.receiver.id != receiver_identity.id {
+        return Err(format!(
+            "frame batch receiver_id {} does not match configured receiver_id {}",
+            batch.receiver.id, receiver_identity.id
+        ));
+    }
+
+    batch.receiver = receiver_identity.clone();
+    for record in &mut batch.records {
+        if let Some(record_receiver) = &record.receiver
+            && record_receiver.id != receiver_identity.id
+        {
+            return Err(format!(
+                "frame record receiver_id {} does not match configured receiver_id {}",
+                record_receiver.id, receiver_identity.id
+            ));
+        }
+        record.receiver = Some(receiver_identity.clone());
+    }
+    batch.validate().map_err(|error| error.to_string())?;
+
+    Ok(batch)
+}
+
 fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path, kind: &str) -> Result<T, String> {
     let contents = fs::read_to_string(path)
         .map_err(|error| format!("{}: read failed: {error}", path.display()))?;
@@ -790,7 +837,7 @@ fn parse_frame_record_line(
 #[derive(Debug, Clone)]
 #[cfg(feature = "websocket")]
 struct SubmissionWorker {
-    sender: std::sync::mpsc::Sender<FeedMessage>,
+    sender: std::sync::mpsc::Sender<SubmissionPayload>,
     status: Arc<Mutex<SubmissionStatus>>,
 }
 
@@ -832,7 +879,7 @@ fn start_submission_worker(config: SubmissionConfig) -> Result<SubmissionWorker,
 
 #[cfg(feature = "websocket")]
 fn run_submission_worker(
-    receiver: std::sync::mpsc::Receiver<FeedMessage>,
+    receiver: std::sync::mpsc::Receiver<SubmissionPayload>,
     config: &SubmissionConfig,
     aggregate_urls: &[String],
     outbox: Option<&SubmissionOutbox>,
@@ -844,7 +891,7 @@ fn run_submission_worker(
 
     publish_submission_status(shared_status, &stats);
     eprintln!(
-        "Submitting signed receiver feed messages to {}",
+        "Submitting signed receiver payloads to {}",
         aggregate_urls.join(", ")
     );
     if let Some(outbox) = &outbox {
@@ -864,12 +911,10 @@ fn run_submission_worker(
         publish_submission_status(shared_status, &stats);
     }
 
-    for message in receiver {
+    for payload in receiver {
         stats.received = stats.received.saturating_add(1);
-        let message = match validate_feed_schema(Path::new("receiver"), 0, message)
-            .and_then(|message| message_for_signing(message, &config.receiver_identity))
-        {
-            Ok(message) => message,
+        let payload = match payload_for_signing(payload, &config.receiver_identity) {
+            Ok(payload) => payload,
             Err(error) => {
                 stats.last_error = Some(error.clone());
                 eprintln!("receiver submission skipped: {error}");
@@ -877,10 +922,10 @@ fn run_submission_worker(
                 continue;
             }
         };
-        let submission = match config.signer.sign(message, unix_time_ms()) {
+        let submission = match config.signer.sign_payload(payload, unix_time_ms()) {
             Ok(submission) => submission,
             Err(error) => {
-                let error = format!("failed to sign feed message: {error}");
+                let error = format!("failed to sign submission payload: {error}");
                 stats.last_error = Some(error.clone());
                 eprintln!("{error}");
                 publish_submission_status(shared_status, &stats);
@@ -949,19 +994,27 @@ fn flush_submission_outbox(
     aggregate_urls: &[String],
     stats: &mut SubmissionStatus,
 ) -> Result<(), String> {
+    flush_submission_outbox_with_submitter(outbox, aggregate_urls, stats, submit_to_aggregate_url)
+}
+
+#[cfg(feature = "websocket")]
+fn flush_submission_outbox_with_submitter(
+    outbox: &SubmissionOutbox,
+    aggregate_urls: &[String],
+    stats: &mut SubmissionStatus,
+    mut submitter: impl FnMut(&str, &SignedSubmission, &mut SubmissionStatus) -> Result<(), String>,
+) -> Result<(), String> {
     let load = outbox.load().map_err(|error| error.to_string())?;
     let loaded_count = load.entries.len();
     let mut pending = Vec::new();
     let mut first_error = None;
+    let mut failed_urls = Vec::<String>::new();
+    let mut changed = load.discarded != 0;
 
     stats.update_outbox_pending(&load.entries);
 
     for mut entry in load.entries {
-        if first_error.is_some() {
-            pending.push(entry);
-            continue;
-        }
-
+        let original_pending_urls = entry.pending_urls.clone();
         let urls = if entry.pending_urls.is_empty() {
             aggregate_urls.to_vec()
         } else {
@@ -969,26 +1022,37 @@ fn flush_submission_outbox(
         };
         let mut pending_urls = Vec::new();
 
-        for (index, url) in urls.iter().enumerate() {
-            match submit_to_aggregate_url(url, &entry.submission, stats) {
+        for url in &urls {
+            if failed_urls.iter().any(|failed_url| failed_url == url) {
+                pending_urls.push(url.clone());
+                continue;
+            }
+
+            match submitter(url, &entry.submission, stats) {
                 Ok(()) => {}
                 Err(error) => {
-                    first_error = Some(error);
-                    pending_urls.extend(urls[index..].iter().cloned());
-                    break;
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    failed_urls.push(url.clone());
+                    pending_urls.push(url.clone());
                 }
             }
         }
 
         if pending_urls.is_empty() {
             stats.outbox_delivered = stats.outbox_delivered.saturating_add(1);
+            changed = true;
         } else {
+            if pending_urls != original_pending_urls {
+                changed = true;
+            }
             entry.pending_urls = pending_urls;
             pending.push(entry);
         }
     }
 
-    if load.discarded != 0 || first_error.is_none() || pending.len() != loaded_count {
+    if changed || first_error.is_none() || pending.len() != loaded_count {
         outbox
             .replace(&pending)
             .map_err(|error| error.to_string())?;
@@ -1182,7 +1246,8 @@ fn write_http_post_request(
     );
 
     stream.write_all(request.as_bytes())?;
-    stream.write_all(body)
+    stream.write_all(body)?;
+    stream.flush()
 }
 
 #[cfg(feature = "websocket")]
@@ -1226,10 +1291,9 @@ fn connect_http_target(
 
 #[cfg(feature = "websocket")]
 fn read_http_response(url: &str, mut stream: impl Read) -> Result<String, String> {
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("{url}: response read failed: {error}"))?;
+    let response = read_http_response_bytes(url, &mut stream, DEFAULT_HTTP_TIMEOUT)?;
+    let response = String::from_utf8(response)
+        .map_err(|error| format!("{url}: response was not valid UTF-8: {error}"))?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| format!("{url}: invalid HTTP response"))?;
@@ -1240,6 +1304,64 @@ fn read_http_response(url: &str, mut stream: impl Read) -> Result<String, String
     }
 
     Ok(body.to_owned())
+}
+
+#[cfg(feature = "websocket")]
+fn read_http_response_bytes(
+    url: &str,
+    stream: &mut impl Read,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 8192];
+
+    loop {
+        if http_response_complete(&response).map_err(|error| format!("{url}: {error}"))? {
+            return Ok(response);
+        }
+
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                if response.is_empty() {
+                    return Err(format!("{url}: empty HTTP response"));
+                }
+                return Ok(response);
+            }
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("{url}: response read timed out"));
+                }
+            }
+            Err(error) => return Err(format!("{url}: response read failed: {error}")),
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+fn http_response_complete(response: &[u8]) -> Result<bool, String> {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Ok(false);
+    };
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|error| format!("invalid HTTP response headers: {error}"))?;
+    let Some(content_length) = headers.lines().find_map(http_content_length) else {
+        return Ok(false);
+    };
+
+    Ok(response.len() >= header_end + 4 + content_length)
+}
+
+#[cfg(feature = "websocket")]
+fn http_content_length(line: &str) -> Option<usize> {
+    let (name, value) = line.split_once(':')?;
+    name.eq_ignore_ascii_case("content-length")
+        .then(|| value.trim().parse::<usize>().ok())
+        .flatten()
 }
 
 #[cfg(feature = "websocket")]
@@ -1359,7 +1481,7 @@ mod tests {
     #[cfg(feature = "websocket")]
     use crate::config::BYTES_PER_MEGABYTE;
     #[cfg(feature = "websocket")]
-    use rsdb::SubmissionOutboxConfig;
+    use rsdb::{Protocol, SubmissionOutboxConfig};
 
     #[cfg(feature = "websocket")]
     #[test]
@@ -1491,6 +1613,83 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn submission_outbox_discards_submission_id_mismatches() {
+        let dir = temp_test_dir("rsdb-submit-outbox-id-mismatch");
+        let urls = test_submit_urls();
+        let outbox = SubmissionOutbox::open(&SubmissionOutboxConfig {
+            dir: dir.clone(),
+            max_bytes: BYTES_PER_MEGABYTE,
+        })
+        .unwrap();
+        let mut submission = signed_test_submission(1);
+        submission.submission_id = "bad-submission-id".to_owned();
+        let entry = PendingSubmission::new(submission, &urls);
+
+        fs::write(outbox.path(), serde_json::to_vec(&entry).unwrap()).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(outbox.path())
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+
+        let load = outbox.load().unwrap();
+
+        assert_eq!(load.entries.len(), 0);
+        assert_eq!(load.discarded, 1);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn submission_outbox_continues_healthy_targets_after_target_failure() {
+        let dir = temp_test_dir("rsdb-submit-outbox-partial-target-failure");
+        let healthy_url = "http://healthy.example.test/submit".to_owned();
+        let failing_url = "https://failing.example.test/submit".to_owned();
+        let urls = vec![healthy_url.clone(), failing_url.clone()];
+        let outbox = SubmissionOutbox::open(&SubmissionOutboxConfig {
+            dir: dir.clone(),
+            max_bytes: BYTES_PER_MEGABYTE,
+        })
+        .unwrap();
+        outbox.append(&signed_test_submission(1), &urls).unwrap();
+        outbox.append(&signed_test_submission(2), &urls).unwrap();
+        let mut stats = SubmissionStatus::enabled(urls.clone(), true);
+
+        let error =
+            flush_submission_outbox_with_submitter(&outbox, &urls, &mut stats, |url, _, stats| {
+                if url == healthy_url {
+                    stats.record_delivery(url, unix_time_ms());
+                    Ok(())
+                } else {
+                    let error = format!("{url}: simulated failure");
+                    stats.record_failure(url, error.clone());
+                    Err(error)
+                }
+            })
+            .unwrap_err();
+        let load = outbox.load().unwrap();
+
+        assert!(error.contains("simulated failure"));
+        assert_eq!(stats.targets[0].url, healthy_url);
+        assert_eq!(stats.targets[0].delivered, 2);
+        assert_eq!(stats.targets[0].failed_attempts, 0);
+        assert_eq!(stats.targets[1].url, failing_url);
+        assert_eq!(stats.targets[1].delivered, 0);
+        assert_eq!(stats.targets[1].failed_attempts, 1);
+        assert_eq!(load.entries.len(), 2);
+        assert!(
+            load.entries
+                .iter()
+                .all(|entry| entry.pending_urls == [failing_url.clone()])
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn message_for_signing_attaches_configured_receiver() {
         let receiver = ReceiverIdentity::named("sf-rsdb-pi".to_owned(), "SF".to_owned());
@@ -1508,6 +1707,39 @@ mod tests {
             .with_receiver(Some(ReceiverIdentity::new("other-rsdb-pi".to_owned())));
 
         let error = message_for_signing(message, &receiver).unwrap_err();
+
+        assert!(error.contains("does not match configured receiver_id sf-rsdb-pi"));
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn frame_batch_for_signing_attaches_configured_receiver_to_records() {
+        let receiver = ReceiverIdentity::new("sf-rsdb-pi".to_owned());
+        let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+        let batch = FrameRecordBatch::new(
+            Protocol::Adsb1090,
+            receiver.clone(),
+            vec![FrameRecord::new(42, 0, &frame)],
+        );
+
+        let signed_batch = frame_batch_for_signing(batch, &receiver).unwrap();
+
+        assert_eq!(signed_batch.receiver, receiver);
+        assert_eq!(signed_batch.records[0].receiver.as_ref(), Some(&receiver));
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn frame_batch_for_signing_rejects_receiver_mismatch() {
+        let receiver = ReceiverIdentity::new("sf-rsdb-pi".to_owned());
+        let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+        let batch = FrameRecordBatch::new(
+            Protocol::Adsb1090,
+            ReceiverIdentity::new("other-rsdb-pi".to_owned()),
+            vec![FrameRecord::new(42, 0, &frame)],
+        );
+
+        let error = frame_batch_for_signing(batch, &receiver).unwrap_err();
 
         assert!(error.contains("does not match configured receiver_id sf-rsdb-pi"));
     }
@@ -1554,6 +1786,37 @@ mod tests {
 
         assert_eq!(target.port, 8443);
         assert_eq!(target.host_header(), "agg.example.com:8443");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn http_response_reader_stops_after_content_length() {
+        struct WouldBlockAfterResponse {
+            response: &'static [u8],
+            offset: usize,
+        }
+
+        impl Read for WouldBlockAfterResponse {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.offset >= self.response.len() {
+                    return Err(std::io::Error::from(ErrorKind::WouldBlock));
+                }
+                let read = buffer.len().min(self.response.len() - self.offset);
+                buffer[..read].copy_from_slice(&self.response[self.offset..self.offset + read]);
+                self.offset += read;
+                Ok(read)
+            }
+        }
+
+        let response = b"HTTP/1.1 202 Accepted\r\nContent-Length: 12\r\n\r\n{\"ok\":true}\n";
+        let mut stream = WouldBlockAfterResponse {
+            response,
+            offset: 0,
+        };
+
+        let body = read_http_response("https://aggregate.example.com/submit", &mut stream).unwrap();
+
+        assert_eq!(body, "{\"ok\":true}\n");
     }
 
     #[test]
@@ -1768,8 +2031,8 @@ mod websocket {
     };
     use rsdb::{
         AircraftSnapshot, FeedBootstrap, FeedMessage, FeedStats, PersistenceStatus, Protocol,
-        RadioConfig, ReceiverIdentity, ReceiverSite, ServiceStatus, SubmissionStatus,
-        enrich_aircraft_snapshots,
+        RadioConfig, ReceiverIdentity, ReceiverSite, ServiceStatus, SubmissionPayload,
+        SubmissionStatus, enrich_aircraft_snapshots,
     };
 
     pub fn serve(
@@ -1821,8 +2084,16 @@ mod websocket {
                 |message| {
                     let message = hub.enrich_heartbeat(message);
                     hub.publish(&message)?;
+                    if let Some(sender) = &submission_sender
+                        && matches!(message, FeedMessage::Heartbeat { .. })
+                    {
+                        let _ = sender.send(SubmissionPayload::FeedMessage(message));
+                    }
+                    Ok(())
+                },
+                |batch| {
                     if let Some(sender) = &submission_sender {
-                        let _ = sender.send(message);
+                        let _ = sender.send(SubmissionPayload::FrameRecords(batch));
                     }
                     Ok(())
                 },

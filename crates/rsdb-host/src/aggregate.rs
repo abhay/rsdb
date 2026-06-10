@@ -4,12 +4,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AircraftSnapshot, FeedMessage, FeedStats, FrameRecordBatch, FrameReplayConfig, Protocol,
-    ReceiverIdentity, ReceiverSite, SubmissionHealth,
+    AircraftSnapshot, AircraftStore, FeedMessage, FeedStats, FrameRecordBatch, Protocol,
+    ReceiverIdentity, ReceiverSite, SubmissionHealth, enrich_aircraft_snapshot,
     feed::{
         API_SCHEMA_VERSION, ApiEndpoint, ApiSchema, FeedMessageSchema, FieldSchema, WebSocketSchema,
     },
-    replay_frame_records,
 };
 
 pub const AGGREGATE_SCHEMA_VERSION: u32 = 1;
@@ -476,7 +475,7 @@ impl AggregateStore {
             return Ok(AggregateIngestResult::duplicate());
         }
 
-        let messages = Self::feed_messages_from_frame_batch(batch, submitted_at_ms)?;
+        let messages = self.apply_frame_record_batch(batch, submitted_at_ms)?;
         let mut applied_messages = Vec::with_capacity(messages.len());
         for message in messages {
             applied_messages.push(self.apply_verified(message, submitted_at_ms)?);
@@ -529,7 +528,7 @@ impl AggregateStore {
             return Ok(false);
         }
 
-        for message in Self::feed_messages_from_frame_batch(batch, submitted_at_ms)? {
+        for message in self.apply_frame_record_batch(batch, submitted_at_ms)? {
             self.apply_verified(message, submitted_at_ms)?;
         }
         self.record_accepted_submission(submitted_at_ms);
@@ -548,7 +547,8 @@ impl AggregateStore {
         self.accepted_submission_ids.contains_key(submission_id)
     }
 
-    fn feed_messages_from_frame_batch(
+    fn apply_frame_record_batch(
+        &mut self,
         batch: &FrameRecordBatch,
         submitted_at_ms: u64,
     ) -> Result<Vec<FeedMessage>, AggregateStoreError> {
@@ -556,17 +556,62 @@ impl AggregateStore {
             .validate()
             .map_err(|error| AggregateStoreError::InvalidFrameRecords(error.to_string()))?;
 
-        let initial_now_ms = batch
-            .records
-            .first()
-            .map_or(submitted_at_ms, |record| record.now_ms);
-        let mut replay_config = FrameReplayConfig::new(batch.protocol, initial_now_ms);
-        replay_config.receiver_identity = Some(batch.receiver.clone());
-        replay_config.receiver_site = batch.receiver_site();
+        let receiver = batch.receiver.clone().with_generated_handle();
+        let receiver_site = batch.receiver_site();
+        let mut messages = Vec::new();
 
-        replay_frame_records(&batch.records, &replay_config)
-            .map(|messages| messages.into_iter().skip(1).collect())
-            .map_err(|error| AggregateStoreError::InvalidFrameRecords(error.to_string()))
+        for record in &batch.records {
+            let snapshot = {
+                let aggregate = self
+                    .receivers
+                    .entry(receiver.id.clone())
+                    .or_insert_with(|| ReceiverAggregate::new(receiver.clone()));
+                aggregate.receiver.clone_from(&receiver);
+                aggregate.protocol = batch.protocol;
+                aggregate
+                    .decoder
+                    .update_frame_record(record)
+                    .map_err(|error| AggregateStoreError::InvalidFrameRecords(error.to_string()))?
+            };
+
+            if let Some(snapshot) = snapshot {
+                messages.push(
+                    FeedMessage::aircraft_for_protocol(
+                        batch.protocol,
+                        record.now_ms,
+                        enrich_aircraft_snapshot(snapshot, receiver_site.as_ref(), record.now_ms),
+                    )
+                    .with_receiver(Some(receiver.clone())),
+                );
+            }
+
+            let stale_aircraft = {
+                let aggregate = self
+                    .receivers
+                    .entry(receiver.id.clone())
+                    .or_insert_with(|| ReceiverAggregate::new(receiver.clone()));
+                aggregate
+                    .decoder
+                    .evict_stale(record.now_ms, AGGREGATE_AIRCRAFT_STALE_AFTER_MS)
+            };
+            for removed in stale_aircraft {
+                messages.push(
+                    FeedMessage::stale_aircraft_for_protocol(
+                        batch.protocol,
+                        record.now_ms,
+                        removed.icao,
+                    )
+                    .with_receiver(Some(receiver.clone())),
+                );
+            }
+        }
+
+        if messages.is_empty() {
+            self.last_submission_ms = Some(submitted_at_ms);
+            self.last_error = None;
+        }
+
+        Ok(messages)
     }
 
     fn apply_verified(
@@ -683,6 +728,7 @@ impl AggregateStore {
                         ReceiverAggregate {
                             receiver: receiver.receiver.with_generated_handle(),
                             protocol: receiver.protocol,
+                            decoder: AircraftStore::default(),
                             aircraft: receiver
                                 .aircraft
                                 .into_iter()
@@ -937,6 +983,7 @@ impl std::error::Error for AggregateStoreError {}
 struct ReceiverAggregate {
     receiver: ReceiverIdentity,
     protocol: Protocol,
+    decoder: AircraftStore,
     aircraft: BTreeMap<String, AircraftSnapshot>,
     messages_accepted: u64,
     last_message_ms: Option<u64>,
@@ -951,6 +998,7 @@ impl ReceiverAggregate {
         Self {
             receiver,
             protocol: Protocol::Adsb1090,
+            decoder: AircraftStore::default(),
             aircraft: BTreeMap::new(),
             messages_accepted: 0,
             last_message_ms: None,
@@ -999,7 +1047,7 @@ impl ReceiverAggregate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Frame, FrameRecord, FrameRecordBatch, ReceiverHandle};
+    use crate::{Frame, FrameRecord, FrameRecordBatch, PositionStatus, ReceiverHandle};
 
     #[test]
     fn aggregate_api_schema_describes_aggregate_contract() {
@@ -1160,6 +1208,40 @@ mod tests {
         assert_eq!(status.submissions_duplicate, 1);
         assert_eq!(status.receivers[0].messages_accepted, 1);
         assert_eq!(store.snapshot(140).aircraft.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_store_keeps_frame_decoder_state_across_batches() {
+        let mut store = AggregateStore::new();
+        let receiver = receiver("sf-a");
+        let even = Frame::from_hex("8D40621D58C382D690C8AC2863A7").unwrap();
+        let odd = Frame::from_hex("8D40621D58C386435CC412692AD6").unwrap();
+        let even_batch = FrameRecordBatch::new(
+            Protocol::Adsb1090,
+            receiver.clone(),
+            vec![FrameRecord::new(1_000, 0, &even).with_receiver(Some(receiver.clone()))],
+        );
+        let odd_batch = FrameRecordBatch::new(
+            Protocol::Adsb1090,
+            receiver.clone(),
+            vec![FrameRecord::new(2_000, 1_000, &odd).with_receiver(Some(receiver))],
+        );
+
+        store
+            .ingest_verified_frame_records_submission("submission-1", &even_batch, 1_100)
+            .unwrap();
+        store
+            .ingest_verified_frame_records_submission("submission-2", &odd_batch, 2_100)
+            .unwrap();
+
+        let snapshot = store.snapshot(2_200);
+        let aircraft = &snapshot.aircraft[0].aircraft;
+
+        assert_eq!(aircraft.icao, "40621D");
+        assert_eq!(aircraft.position_status, PositionStatus::Fresh);
+        assert_eq!(aircraft.position_last_seen_ms, Some(2_000));
+        assert!(aircraft.lat.is_some());
+        assert!(aircraft.lon.is_some());
     }
 
     #[test]

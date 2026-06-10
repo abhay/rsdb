@@ -27,6 +27,10 @@ binary stream, but they keep submission logs inspectable, curl-friendly, and eas
 to replay. Binary receiver formats should be adapters that produce signed JSON
 submissions.
 
+Live receivers submit aircraft data as signed `FrameRecordBatch` payloads. They
+still submit heartbeat `FeedMessage` payloads so aggregates can show receiver
+health, USB counters, receiver site, and submission outbox state.
+
 ## Receiver Diagnostics Endpoints
 
 When `rsdb-usb serve` is running locally:
@@ -177,5 +181,6 @@ Raw-frame submissions wrap multiple decoded records under one receiver:
 
 The aggregate validates the batch schema, receiver ID, protocol, record
 metadata, and sequence fields before appending the accepted submission to disk.
-Decoded aircraft updates from the batch are broadcast as normal `FeedMessage`
-values on `/ws`.
+It keeps decoder state per receiver, so frame records split across submissions
+can still combine into aircraft positions. Decoded aircraft updates from the
+batch are broadcast as normal `FeedMessage` values on `/ws`.

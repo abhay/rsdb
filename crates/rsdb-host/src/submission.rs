@@ -300,9 +300,9 @@ impl SubmissionOutbox {
             .open(&self.path)
             .map_err(|error| SubmissionOutboxError::io(&self.path, "open outbox failed", error))?;
         let entry = PendingSubmission::new(submission.clone(), urls);
-
-        serde_json::to_writer(&mut file, &entry).map_err(|error| {
-            SubmissionOutboxError::json(Some(&self.path), "encode outbox submission failed", error)
+        let encoded = encode_pending_submission(&entry, Some(&self.path))?;
+        file.write_all(&encoded).map_err(|error| {
+            SubmissionOutboxError::io(&self.path, "append outbox failed", error)
         })?;
         file.write_all(b"\n").map_err(|error| {
             SubmissionOutboxError::io(&self.path, "append outbox failed", error)
@@ -342,7 +342,17 @@ impl SubmissionOutbox {
                 continue;
             }
             match serde_json::from_str::<PendingSubmission>(line) {
-                Ok(entry) => load.entries.push(entry),
+                Ok(entry) => match validate_pending_submission(&entry) {
+                    Ok(()) => load.entries.push(entry),
+                    Err(error) => {
+                        load.discarded = load.discarded.saturating_add(1);
+                        eprintln!(
+                            "{}:{}: discarded invalid outbox entry: {error}",
+                            self.path.display(),
+                            line_index + 1
+                        );
+                    }
+                },
                 Err(error) => {
                     load.discarded = load.discarded.saturating_add(1);
                     eprintln!(
@@ -369,12 +379,9 @@ impl SubmissionOutbox {
                 SubmissionOutboxError::io(&tmp_path, "create temp outbox failed", error)
             })?);
             for entry in entries {
-                serde_json::to_writer(&mut writer, entry).map_err(|error| {
-                    SubmissionOutboxError::json(
-                        Some(&tmp_path),
-                        "encode temp outbox submission failed",
-                        error,
-                    )
+                let encoded = encode_pending_submission(entry, Some(&tmp_path))?;
+                writer.write_all(&encoded).map_err(|error| {
+                    SubmissionOutboxError::io(&tmp_path, "write temp outbox failed", error)
                 })?;
                 writer.write_all(b"\n").map_err(|error| {
                     SubmissionOutboxError::io(&tmp_path, "write temp outbox failed", error)
@@ -423,10 +430,32 @@ fn outbox_bytes(entries: &[PendingSubmission]) -> SubmissionOutboxResult<u64> {
 }
 
 fn submission_line_bytes(entry: &PendingSubmission) -> SubmissionOutboxResult<u64> {
-    let bytes = serde_json::to_vec(entry)
-        .map_err(|error| {
-            SubmissionOutboxError::json(None, "encode outbox submission failed", error)
-        })?
-        .len();
+    let bytes = encode_pending_submission(entry, None)?.len();
     Ok(u64::try_from(bytes).unwrap_or(u64::MAX).saturating_add(1))
+}
+
+fn encode_pending_submission(
+    entry: &PendingSubmission,
+    path: Option<&Path>,
+) -> SubmissionOutboxResult<Vec<u8>> {
+    validate_pending_submission(entry).map_err(|error| {
+        SubmissionOutboxError::json(path, "validate outbox submission failed", error)
+    })?;
+    let encoded = serde_json::to_vec(entry).map_err(|error| {
+        SubmissionOutboxError::json(path, "encode outbox submission failed", error)
+    })?;
+    let decoded = serde_json::from_slice::<PendingSubmission>(&encoded).map_err(|error| {
+        SubmissionOutboxError::json(path, "decode encoded outbox submission failed", error)
+    })?;
+    validate_pending_submission(&decoded).map_err(|error| {
+        SubmissionOutboxError::json(path, "validate encoded outbox submission failed", error)
+    })?;
+    Ok(encoded)
+}
+
+fn validate_pending_submission(entry: &PendingSubmission) -> Result<(), serde_json::Error> {
+    entry
+        .submission
+        .validate_envelope()
+        .map_err(serde::ser::Error::custom)
 }
