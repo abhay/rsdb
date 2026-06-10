@@ -1043,17 +1043,14 @@ h3 {
   overflow: hidden;
 }
 
-/* deck.gl renders into this <canvas> (passed via canvas:) — fills the sized host. */
+/* deck.gl mounts its own <canvas> into this sized host (passed via parent:). */
 .cs-deck {
   position: absolute;
   inset: 0;
-  width: 100%;
-  height: 100%;
-  display: block;
   cursor: grab;
-  outline: none;
 }
 .cs-deck:active { cursor: grabbing; }
+.cs-deck canvas { display: block; outline: none; }
 
 /* Shared floating-panel chrome (rsdb-dark variant of the viz .overlay look). */
 .cs-overlay {

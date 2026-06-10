@@ -757,7 +757,6 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
   // Mount the single deck.DeckGL instance. Cleanup finalizes the GL context.
   // ------------------------------------------------------------------
   useEffect(() => {
-    if (!containerRef.current) return undefined;
     const deck = window.deck;
     if (!deck || !deck.DeckGL) return undefined;
 
@@ -791,17 +790,38 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
       };
     };
 
-    const instance = new deck.DeckGL({
-      canvas: containerRef.current,
-      views: [orbitView],
-      initialViewState: initialViewState,
-      controller: true,
-      getTooltip: getTooltip,
-      layers: [],
-    });
-    deckRef.current = instance;
+    let raf = 0;
+    let cancelled = false;
+
+    // Mount via the scripting wrapper's `container:` option: deck creates its
+    // OWN canvas inside this element and wires the OrbitView controller's
+    // drag/zoom handling to it. `parent:` is ignored by the scripting DeckGL
+    // (it escapes to a window-sized canvas on <html>); BYO `canvas:` stays in
+    // place but does NOT get the controller interaction (drag won't orbit).
+    // `container:` gives both: contained in the panel AND fully interactive.
+    // Defer until the host has a resolved, non-zero size so deck's initial
+    // canvas dimensions match the panel.
+    const mount = () => {
+      if (cancelled) return;
+      const el = containerRef.current;
+      if (!el || el.clientWidth === 0 || el.clientHeight === 0) {
+        raf = requestAnimationFrame(mount);
+        return;
+      }
+      deckRef.current = new deck.DeckGL({
+        container: el,
+        views: [orbitView],
+        initialViewState: initialViewState,
+        controller: true,
+        getTooltip: getTooltip,
+        layers: [],
+      });
+    };
+    mount();
 
     return () => {
+      cancelled = true;
+      if (raf) cancelAnimationFrame(raf);
       if (deckRef.current) {
         deckRef.current.finalize(); // release the GL context on unmount (no leak)
         deckRef.current = null;
@@ -1277,7 +1297,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
         </div>
       </div>
       <div className="cs-deck-wrap">
-        <canvas ref={containerRef} className="cs-deck" aria-label="Live coverage visualization" />
+        <div ref={containerRef} className="cs-deck" aria-label="Live coverage visualization" />
 
         {/* Controls (top-right) */}
         <div className="cs-overlay cs-controls">
