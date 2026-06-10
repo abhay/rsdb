@@ -652,6 +652,10 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
   const [sliceAlt, setSliceAlt] = useState(18000);
   const [sliceCount, setSliceCount] = useState(0); // slice band point count (driven by the redraw)
 
+  // Collapsible overlays so the panels don't bury the map.
+  const [collapsed, setCollapsed] = useState({ controls: false, legend: false });
+  const togglePanel = (k) => setCollapsed((c) => ({ ...c, [k]: !c[k] }));
+
   // dataTick forces deck rebuild + panel redraws when refs alone change.
   const [dataTick, setDataTick] = useState(0);
 
@@ -1300,7 +1304,17 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
         <div ref={containerRef} className="cs-deck" aria-label="Live coverage visualization" />
 
         {/* Controls (top-right) */}
-        <div className="cs-overlay cs-controls">
+        <div className={`cs-overlay cs-controls${collapsed.controls ? " is-collapsed" : ""}`}>
+          <button
+            type="button"
+            className="cs-panel-head"
+            onClick={() => togglePanel("controls")}
+            aria-expanded={!collapsed.controls}
+          >
+            <span className="cs-panel-title">Controls</span>
+            <span className="cs-caret" aria-hidden="true">{collapsed.controls ? "▸" : "▾"}</span>
+          </button>
+          <div className="cs-panel-body">
           <div className="cs-group">
             <div className="cs-group-label">Display</div>
             <div className="cs-slider-row">
@@ -1397,47 +1411,27 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
               />
             </div>
           </div>
-        </div>
-
-        {/* HUD (bottom-left) */}
-        <div className="cs-overlay cs-hud">
-          <div className="cs-group-label">Station Telemetry</div>
-          <div className="cs-hud-grid">
-            <div className="cs-hud-item">
-              <div className="cs-k">Max range</div>
-              <div className="cs-v">{maxRangeKm > 0 ? maxRangeKm.toFixed(0) : "—"}<span className="cs-u">km</span></div>
-            </div>
-            <div className="cs-hud-item">
-              <div className="cs-k">Max altitude</div>
-              <div className="cs-v">{maxAltFt > 0 ? fmtN(Math.round(maxAltFt)) : "—"}<span className="cs-u">ft</span></div>
-            </div>
-            <div className="cs-hud-item">
-              <div className="cs-k">Cloud points</div>
-              <div className="cs-v">{fmtN(cloudPoints)}</div>
-            </div>
-            <div className="cs-hud-item">
-              <div className="cs-k">Unique aircraft</div>
-              <div className="cs-v">{fmtN(uniqueAircraft)}</div>
-            </div>
-            <div className="cs-hud-item">
-              <div className="cs-k">Live now</div>
-              <div className="cs-v">{fmtN(liveCount)}</div>
-            </div>
-            <div className="cs-hud-item">
-              <div className="cs-k">Anchor</div>
-              <div className="cs-v cs-v-small">{anchorLabel}</div>
-            </div>
           </div>
         </div>
 
         {/* Legend (bottom-right) */}
-        <div className="cs-overlay cs-legend">
-          <div className="cs-legend-cap">Altitude</div>
-          <div className="cs-ramp" style={{ background: legendRamp }} />
-          <div className="cs-scale">
-            {legendTicks.map((t) => (
-              <div className="cs-tick" key={t}>{t}</div>
-            ))}
+        <div className={`cs-overlay cs-legend${collapsed.legend ? " is-collapsed" : ""}`}>
+          <button
+            type="button"
+            className="cs-panel-head cs-legend-head"
+            onClick={() => togglePanel("legend")}
+            aria-expanded={!collapsed.legend}
+          >
+            <span className="cs-panel-title">Altitude</span>
+            <span className="cs-caret" aria-hidden="true">{collapsed.legend ? "▸" : "▾"}</span>
+          </button>
+          <div className="cs-legend-body">
+            <div className="cs-ramp" style={{ background: legendRamp }} />
+            <div className="cs-scale">
+              {legendTicks.map((t) => (
+                <div className="cs-tick" key={t}>{t}</div>
+              ))}
+            </div>
           </div>
         </div>
 
