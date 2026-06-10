@@ -1064,16 +1064,43 @@ h3 {
   -webkit-backdrop-filter: blur(12px) saturate(130%);
 }
 
+/* Collapsible panel header (click to expand/collapse) */
+.cs-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  margin: 0 0 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.cs-panel-head:hover { color: var(--muted); }
+.cs-panel-head .cs-caret { font-size: 10px; line-height: 1; color: var(--muted); }
+.cs-overlay.is-collapsed .cs-panel-head { margin-bottom: 0; }
+.cs-controls.is-collapsed .cs-panel-body,
+.cs-legend.is-collapsed .cs-legend-body { display: none; }
+/* collapsed controls shrink to just the header pill */
+.cs-controls.is-collapsed { width: auto; padding-bottom: 9px; }
+
 /* Controls (top-right) */
 .cs-controls {
-  top: 12px;
-  right: 12px;
-  width: 250px;
-  padding: 12px 14px 14px;
-  max-height: calc(100% - 24px);
+  top: 10px;
+  right: 10px;
+  width: 204px;
+  padding: 9px 11px 11px;
+  max-height: calc(100% - 20px);
   overflow-y: auto;
 }
-.cs-group { margin-bottom: 14px; }
+.cs-group { margin-bottom: 11px; }
 .cs-group:last-child { margin-bottom: 0; }
 .cs-group-label {
   margin-bottom: 8px;
@@ -1204,63 +1231,22 @@ h3 {
   font-size: 11.5px;
 }
 
-/* Telemetry HUD (bottom-left). Sits above the ~32px .cs-footer. */
-.cs-hud {
-  bottom: 44px;
-  left: 12px;
-  padding: 12px 14px;
-  min-width: 220px;
-}
-.cs-hud-item .cs-v.cs-v-small {
-  font-size: 12px;
-  font-weight: 600;
-}
-.cs-hud-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 9px 18px;
-}
-.cs-hud-item .cs-k {
-  color: var(--faint);
-  font-size: 9.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-.cs-hud-item .cs-v {
-  color: #f3f6fb;
-  font-family: var(--mono);
-  font-size: 16px;
-  font-weight: 600;
-  line-height: 1.25;
-}
-.cs-hud-item .cs-v .cs-u {
-  margin-left: 2px;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 400;
-}
-
 /* Altitude legend (bottom-right). Sits above the ~32px .cs-footer. */
 .cs-legend {
   bottom: 44px;
-  right: 12px;
+  right: 10px;
   display: flex;
-  gap: 12px;
-  padding: 12px 14px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 11px;
 }
-.cs-legend-cap {
-  align-self: center;
-  color: var(--faint);
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  writing-mode: vertical-rl;
-  transform: rotate(180deg);
+.cs-legend-body {
+  display: flex;
+  gap: 10px;
 }
 .cs-ramp {
-  width: 14px;
-  height: 150px;
+  width: 13px;
+  height: 132px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 5px;
 }
@@ -1268,7 +1254,7 @@ h3 {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  height: 150px;
+  height: 132px;
   padding: 1px 0;
 }
 .cs-scale .cs-tick {
