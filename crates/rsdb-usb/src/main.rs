@@ -26,11 +26,11 @@ use rsdb::PendingSubmission;
 #[cfg(feature = "websocket")]
 use rsdb::SubmissionOutbox;
 use rsdb::{
-    AdsbMessage, ExtendedSquitter, FeedMessage, Frame, FrameRecord, FrameReplayConfig, Protocol,
+    AdsbMessage, ExtendedSquitter, FeedMessage, Frame, FrameRecord, FrameReplayConfig, RadioConfig,
     ReceiverAllowlist, ReceiverIdentity, SignedSubmission, SubmissionSigner, SubmissionStatus,
-    replay_frame_records,
+    iq_chunk_metrics, replay_frame_records,
 };
-use usb::{IqStream, RtlSdrConfig, RtlSdrSource, list_rtl_sdr_devices};
+use usb::{GainMode, IqStream, RtlSdrConfig, RtlSdrSource, list_rtl_sdr_devices};
 
 #[cfg(feature = "websocket")]
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -178,7 +178,8 @@ fn run() -> Result<(), String> {
             let seconds = parse_required_seconds(args.get(1), "record-frames seconds")?;
             let path = parse_required_path(args.get(2), "record-frames path")?;
             let index = parse_index(args.get(3), runtime.device_index)?;
-            record_frame_records(runtime.rtl_sdr_config(index), seconds, &path)
+            let feed_config = runtime.feed_config()?;
+            record_frame_records(runtime.rtl_sdr_config(index), &feed_config, seconds, &path)
         }
         Some("replay") => {
             let path = parse_required_path(args.get(1), "replay path")?;
@@ -323,9 +324,9 @@ fn decode_live_frames(config: RtlSdrConfig, seconds: u64) -> Result<(), String> 
             break;
         };
 
-        for (sample_index, frame) in decoder.decode_chunk(&data) {
+        for decoded in decoder.decode_chunk(&data) {
             decoded_count += 1;
-            print_decoded_frame(sample_index, &frame);
+            print_decoded_frame(decoded.sample_index, &decoded.frame);
         }
     }
 
@@ -381,16 +382,12 @@ fn serve_websocket(
     Err("rebuild rsdb-usb with the websocket feature to enable WebSocket serving".to_owned())
 }
 
-fn feed_message_kind(message: &FeedMessage) -> &'static str {
-    match message {
-        FeedMessage::Snapshot { .. } => "snapshot",
-        FeedMessage::Aircraft { .. } => "aircraft",
-        FeedMessage::StaleAircraft { .. } => "stale_aircraft",
-        FeedMessage::Heartbeat { .. } => "heartbeat",
-    }
-}
-
-fn record_frame_records(config: RtlSdrConfig, seconds: u64, path: &Path) -> Result<(), String> {
+fn record_frame_records(
+    config: RtlSdrConfig,
+    feed_config: &FeedRuntimeConfig,
+    seconds: u64,
+    path: &Path,
+) -> Result<(), String> {
     let decoder_kind = FrameDecoderKind::for_protocol(config.protocol, "record-frames")?;
     let file = fs::File::create(path)
         .map_err(|error| format!("{}: create failed: {error}", path.display()))?;
@@ -405,17 +402,20 @@ fn record_frame_records(config: RtlSdrConfig, seconds: u64, path: &Path) -> Resu
     }
 
     let mut source = RtlSdrSource::open(config).map_err(|error| error.to_string())?;
+    let radio = RadioConfig::for_protocol(config.protocol)
+        .with_center_frequency_hz(source.center_frequency_hz())
+        .with_sample_rate_hz(source.sample_rate_hz());
+    let source_metadata = FrameRecordSourceMetadata::new(config, source.tuner_name())?;
     let stream = source
         .start_streaming()
         .map_err(|error| error.to_string())?;
-    let result = record_frame_records_from_stream(
-        config.protocol,
+    let context = FrameRecordStreamContext {
+        radio,
         decoder_kind,
-        &stream,
-        seconds,
-        path,
-        &mut writer,
-    );
+        feed_config,
+        source_metadata: &source_metadata,
+    };
+    let result = record_frame_records_from_stream(context, &stream, seconds, path, &mut writer);
 
     stream.stop();
 
@@ -431,29 +431,99 @@ fn record_frame_records(config: RtlSdrConfig, seconds: u64, path: &Path) -> Resu
     Ok(())
 }
 
-fn record_frame_records_from_stream(
-    protocol: Protocol,
+#[derive(Clone, Copy)]
+struct FrameRecordStreamContext<'a> {
+    radio: RadioConfig,
     decoder_kind: FrameDecoderKind,
+    feed_config: &'a FeedRuntimeConfig,
+    source_metadata: &'a FrameRecordSourceMetadata,
+}
+
+#[derive(Debug, Clone)]
+struct FrameRecordSourceMetadata {
+    gain_mode: String,
+    gain_tenth_db: Option<i32>,
+    bias_t: bool,
+    device_index: u64,
+    tuner_name: String,
+}
+
+impl FrameRecordSourceMetadata {
+    fn new(config: RtlSdrConfig, tuner_name: String) -> Result<Self, String> {
+        let device_index = u64::try_from(config.device_index)
+            .map_err(|_| "RTL-SDR device index overflowed u64".to_owned())?;
+        let (gain_mode, gain_tenth_db) = match config.gain {
+            GainMode::Auto => ("auto".to_owned(), None),
+            GainMode::Manual(gain_tenth_db) => ("manual".to_owned(), Some(gain_tenth_db)),
+        };
+
+        Ok(Self {
+            gain_mode,
+            gain_tenth_db,
+            bias_t: config.bias_t,
+            device_index,
+            tuner_name,
+        })
+    }
+}
+
+fn record_frame_records_from_stream(
+    context: FrameRecordStreamContext<'_>,
     stream: &IqStream,
     seconds: u64,
     path: &Path,
     writer: &mut impl Write,
 ) -> Result<u64, String> {
     let start = Instant::now();
-    let mut decoder = decoder_kind.build_decoder();
+    let mut decoder = context.decoder_kind.build_decoder();
     let mut recorded = 0_u64;
+    let stream_start_ms = unix_time_ms();
+    let stream_id = format!("{}-{stream_start_ms}", context.radio.protocol.key());
+    let mut chunk_sequence = 0_u64;
+    let mut chunk_sample_index = 0_u64;
+    let mut dropped_samples_before = 0_u64;
+    let mut dropped_chunks = 0_u64;
 
     while start.elapsed().as_secs() < seconds {
         let Some(data) = stream.recv() else {
             break;
         };
 
-        for (sample_index, frame) in decoder.decode_chunk(&data) {
-            let sample_index = u64::try_from(sample_index)
-                .map_err(|_| "decoded frame sample index overflowed u64".to_owned())?;
-            let record =
-                FrameRecord::new_for_protocol(protocol, unix_time_ms(), sample_index, &frame)
+        let current_dropped_chunks = stream.dropped_chunks();
+        if current_dropped_chunks > dropped_chunks {
+            let missed_chunks = current_dropped_chunks - dropped_chunks;
+            let chunk_samples = u64::try_from(data.len() / 2)
+                .map_err(|_| "USB chunk sample count overflowed u64".to_owned())?;
+            dropped_samples_before =
+                dropped_samples_before.saturating_add(missed_chunks.saturating_mul(chunk_samples));
+            dropped_chunks = current_dropped_chunks;
+        }
+
+        let chunk_metrics = iq_chunk_metrics(&data);
+        for decoded in decoder.decode_chunk(&data) {
+            let mut record =
+                FrameRecord::from_decoded_frame(context.radio, unix_time_ms(), &decoded)
                     .map_err(|error| error.to_string())?;
+            record.frame_sequence = Some(recorded);
+            record.stream_start_ms = Some(stream_start_ms);
+            record
+                .receiver
+                .clone_from(&context.feed_config.receiver_identity);
+            record
+                .receiver_site
+                .clone_from(&context.feed_config.receiver_site);
+            record.gain_mode = Some(context.source_metadata.gain_mode.clone());
+            record.gain_tenth_db = context.source_metadata.gain_tenth_db;
+            record.bias_t = Some(context.source_metadata.bias_t);
+            record.device_index = Some(context.source_metadata.device_index);
+            record.tuner_name = Some(context.source_metadata.tuner_name.clone());
+            record.stream_id = Some(stream_id.clone());
+            record.chunk_sequence = Some(chunk_sequence);
+            record.chunk_sample_index = Some(chunk_sample_index);
+            record.set_dropped_samples_before(dropped_samples_before);
+            if let Some(metrics) = chunk_metrics {
+                record.apply_iq_chunk_metrics(metrics);
+            }
 
             serde_json::to_writer(&mut *writer, &record).map_err(|error| error.to_string())?;
             writer
@@ -461,6 +531,11 @@ fn record_frame_records_from_stream(
                 .map_err(|error| format!("{}: write failed: {error}", path.display()))?;
             recorded += 1;
         }
+
+        let chunk_samples = u64::try_from(data.len() / 2)
+            .map_err(|_| "USB chunk sample count overflowed u64".to_owned())?;
+        chunk_sample_index = chunk_sample_index.saturating_add(chunk_samples);
+        chunk_sequence = chunk_sequence.saturating_add(1);
     }
 
     Ok(recorded)
@@ -569,7 +644,7 @@ fn verify_submission_file(allowlist_path: &Path, submission_path: &Path) -> Resu
     println!(
         "ok receiver={} payload={}",
         submission.receiver_id,
-        feed_message_kind(&submission.payload)
+        submission.payload.kind()
     );
     Ok(())
 }

@@ -39,6 +39,20 @@ pub struct DecodedFrame {
     pub sample_index: usize,
     /// Decoded Mode S frame.
     pub frame: Frame,
+    /// Relative signal measurements from the samples that produced the frame.
+    pub signal: DecodedFrameSignal,
+}
+
+/// Relative signal measurements for a decoded Mode S frame.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DecodedFrameSignal {
+    pub signal_power: u32,
+    pub noise_power: u32,
+    pub preamble_high_avg: u32,
+    pub preamble_low_avg: u32,
+    pub preamble_delta: u32,
+    pub bit_margin_min: u32,
+    pub bit_margin_mean: u32,
 }
 
 /// Converts unsigned interleaved RTL-SDR I/Q bytes into magnitude-squared samples.
@@ -72,15 +86,20 @@ pub fn decode_frames_from_magnitudes(magnitudes: &[u32], config: DemodConfig) ->
     let last_start = magnitudes.len() - LONG_FRAME_TOTAL_SAMPLES;
 
     while sample_index <= last_start {
-        if !has_modes_preamble(magnitudes, sample_index, config.min_preamble_delta) {
+        let Some(preamble) =
+            detect_modes_preamble(magnitudes, sample_index, config.min_preamble_delta)
+        else {
             sample_index += 1;
             continue;
-        }
+        };
 
-        if let Some(frame) = decode_long_frame_at(magnitudes, sample_index, config) {
+        if let Some((frame, signal)) =
+            decode_long_frame_at(magnitudes, sample_index, config, preamble)
+        {
             frames.push(DecodedFrame {
                 sample_index,
                 frame,
+                signal,
             });
             sample_index += LONG_FRAME_TOTAL_SAMPLES;
         } else {
@@ -97,7 +116,18 @@ fn centered_magnitude(sample: u8) -> u32 {
     u32::from(magnitude)
 }
 
-fn has_modes_preamble(magnitudes: &[u32], offset: usize, min_delta: u32) -> bool {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PreambleMetrics {
+    high_avg: u32,
+    low_avg: u32,
+    delta: u32,
+}
+
+fn detect_modes_preamble(
+    magnitudes: &[u32],
+    offset: usize,
+    min_delta: u32,
+) -> Option<PreambleMetrics> {
     let high_sum = PREAMBLE_HIGH_SAMPLES
         .iter()
         .map(|sample| magnitudes[offset + sample])
@@ -111,33 +141,53 @@ fn has_modes_preamble(magnitudes: &[u32], offset: usize, min_delta: u32) -> bool
     let low_avg = low_sum / u32::try_from(PREAMBLE_LOW_SAMPLES.len()).expect("nonzero length");
 
     if high_avg <= low_avg.saturating_add(min_delta) {
-        return false;
+        return None;
     }
 
     let pulse_floor = low_avg.saturating_add((high_avg - low_avg) / 2);
     let quiet_ceiling = low_avg.saturating_add((high_avg - low_avg) / 3);
 
-    PREAMBLE_HIGH_SAMPLES
+    let valid = PREAMBLE_HIGH_SAMPLES
         .iter()
         .all(|sample| magnitudes[offset + sample] >= pulse_floor)
         && PREAMBLE_LOW_SAMPLES
             .iter()
-            .all(|sample| magnitudes[offset + sample] <= quiet_ceiling)
+            .all(|sample| magnitudes[offset + sample] <= quiet_ceiling);
+
+    valid.then_some(PreambleMetrics {
+        high_avg,
+        low_avg,
+        delta: high_avg - low_avg,
+    })
 }
 
 fn decode_long_frame_at(
     magnitudes: &[u32],
     preamble_index: usize,
     config: DemodConfig,
-) -> Option<Frame> {
+    preamble: PreambleMetrics,
+) -> Option<(Frame, DecodedFrameSignal)> {
     let mut bytes = [0_u8; FrameLengthBytes::LONG];
     let bit_start = preamble_index + PREAMBLE_SAMPLES;
+    let mut signal_sum = 0_u64;
+    let mut noise_sum = 0_u64;
+    let mut bit_margin_sum = 0_u64;
+    let mut bit_margin_min = u32::MAX;
 
     for bit_index in 0..LONG_FRAME_BITS {
         let sample_index = bit_start + bit_index * SAMPLES_PER_BIT;
         let early = magnitudes[sample_index];
         let late = magnitudes[sample_index + 1];
         let bit = u8::from(early > late);
+        let signal_power = early.max(late);
+        let noise_power = early.min(late);
+        let bit_margin = early.abs_diff(late);
+
+        signal_sum += u64::from(signal_power);
+        noise_sum += u64::from(noise_power);
+        bit_margin_sum += u64::from(bit_margin);
+        bit_margin_min = bit_margin_min.min(bit_margin);
+
         let byte_index = bit_index / 8;
         let bit_shift = 7 - bit_index % 8;
         bytes[byte_index] |= bit << bit_shift;
@@ -149,7 +199,22 @@ fn decode_long_frame_at(
         return None;
     }
 
-    Some(frame)
+    let frame_bits = u64::try_from(LONG_FRAME_BITS).expect("frame length fits u64");
+    let signal = DecodedFrameSignal {
+        signal_power: average_u32(signal_sum, frame_bits),
+        noise_power: average_u32(noise_sum, frame_bits),
+        preamble_high_avg: preamble.high_avg,
+        preamble_low_avg: preamble.low_avg,
+        preamble_delta: preamble.delta,
+        bit_margin_min,
+        bit_margin_mean: average_u32(bit_margin_sum, frame_bits),
+    };
+
+    Some((frame, signal))
+}
+
+fn average_u32(sum: u64, count: u64) -> u32 {
+    u32::try_from(sum / count).expect("average magnitude fits u32")
 }
 
 struct FrameLengthBytes;
@@ -183,6 +248,18 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].sample_index, 5);
         assert_eq!(frames[0].frame, expected);
+        assert_eq!(
+            frames[0].signal,
+            DecodedFrameSignal {
+                signal_power: HIGH_MAGNITUDE,
+                noise_power: LOW_MAGNITUDE,
+                preamble_high_avg: HIGH_MAGNITUDE,
+                preamble_low_avg: LOW_MAGNITUDE,
+                preamble_delta: HIGH_MAGNITUDE - LOW_MAGNITUDE,
+                bit_margin_min: HIGH_MAGNITUDE - LOW_MAGNITUDE,
+                bit_margin_mean: HIGH_MAGNITUDE - LOW_MAGNITUDE,
+            }
+        );
     }
 
     #[test]

@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::{AdsbMessage, ExtendedSquitter, Frame, FrameRecord, FrameRecordError};
+use crate::{
+    AdsbMessage, ExtendedSquitter, Frame, FrameRecord, FrameRecordError,
+    validate_frame_record_sequence,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct FrameAuditReport {
@@ -50,6 +53,7 @@ pub fn audit_frames<'a>(frames: impl IntoIterator<Item = &'a Frame>) -> FrameAud
 /// invalid raw frame.
 pub fn audit_frame_records(records: &[FrameRecord]) -> Result<FrameAuditReport, FrameRecordError> {
     let mut audit = Accumulator::default();
+    validate_frame_record_sequence(records)?;
 
     for record in records {
         let frame = record.parse_frame()?;

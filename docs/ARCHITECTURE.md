@@ -79,7 +79,7 @@ sequenceDiagram
   USB->>R: IQ sample stream
   R->>R: demodulate configured protocol
   R->>R: update local receiver state
-  R->>Q: signed SignedSubmission
+  R->>Q: signed FeedMessage or FrameRecordBatch
   Q->>A: POST /submit
   A->>A: verify allowlist and signature
   A->>A: enqueue to single aggregate writer
@@ -99,15 +99,15 @@ sequenceDiagram
 
 ```text
 1. USB sends I/Q samples to rsdb-usb.
-2. The receiver decodes the configured protocol into protocol-tagged FeedMessage values.
+2. The receiver decodes the configured protocol into protocol-tagged feed updates and frame records.
 3. The receiver updates its local diagnostic state.
-4. The submission worker signs each FeedMessage as a SignedSubmission.
+4. The submission worker signs each payload as a SignedSubmission.
 5. The worker appends submissions to the durable outbox.
 6. The worker POSTs queued submissions to each configured aggregate /submit.
 7. The aggregate verifies the allowlist and signature.
 8. The HTTP worker queues the verified submission to the single writer.
 9. The writer dedupes submission_id and appends accepted submissions to disk.
-10. The writer updates receiver-scoped state and broadcasts live messages.
+10. The writer updates receiver-scoped state and broadcasts live FeedMessage updates.
 11. Browser/API clients bootstrap from HTTP JSON, then use WebSocket for live updates.
 ```
 

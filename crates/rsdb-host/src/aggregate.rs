@@ -4,11 +4,12 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AircraftSnapshot, FeedMessage, FeedStats, Protocol, ReceiverIdentity, ReceiverSite,
-    SubmissionHealth,
+    AircraftSnapshot, FeedMessage, FeedStats, FrameRecordBatch, FrameReplayConfig, Protocol,
+    ReceiverIdentity, ReceiverSite, SubmissionHealth,
     feed::{
         API_SCHEMA_VERSION, ApiEndpoint, ApiSchema, FeedMessageSchema, FieldSchema, WebSocketSchema,
     },
+    replay_frame_records,
 };
 
 pub const AGGREGATE_SCHEMA_VERSION: u32 = 1;
@@ -73,7 +74,7 @@ pub fn aggregate_api_schema() -> ApiSchema {
         feed_messages: vec![
             aggregate_message_schema(
                 "signed_submission",
-                "Signed receiver FeedMessage envelope accepted by POST /submit.",
+                "Signed receiver submission accepted by POST /submit. Payloads may be FeedMessage or FrameRecordBatch JSON.",
             ),
             aggregate_message_schema(
                 "feed_message",
@@ -427,7 +428,9 @@ impl AggregateStore {
         message: FeedMessage,
         submitted_at_ms: u64,
     ) -> Result<FeedMessage, AggregateStoreError> {
-        self.apply_verified(message, submitted_at_ms)
+        let message = self.apply_verified(message, submitted_at_ms)?;
+        self.record_accepted_submission(submitted_at_ms);
+        Ok(message)
     }
 
     /// Applies a previously verified signed submission once.
@@ -448,10 +451,42 @@ impl AggregateStore {
         }
 
         let message = self.apply_verified(message, submitted_at_ms)?;
+        self.record_accepted_submission(submitted_at_ms);
         self.accepted_submission_ids
             .insert(submission_id.to_owned(), submitted_at_ms);
 
         Ok(AggregateIngestResult::applied(message))
+    }
+
+    /// Applies a previously verified signed frame-record batch once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch is invalid or decoded feed messages do not
+    /// carry receiver identity.
+    pub fn ingest_verified_frame_records_submission(
+        &mut self,
+        submission_id: &str,
+        batch: &FrameRecordBatch,
+        submitted_at_ms: u64,
+    ) -> Result<AggregateIngestResult, AggregateStoreError> {
+        if self.accepted_submission_ids.contains_key(submission_id) {
+            self.submissions_duplicate = self.submissions_duplicate.saturating_add(1);
+            self.last_error = None;
+            return Ok(AggregateIngestResult::duplicate());
+        }
+
+        let messages = Self::feed_messages_from_frame_batch(batch, submitted_at_ms)?;
+        let mut applied_messages = Vec::with_capacity(messages.len());
+        for message in messages {
+            applied_messages.push(self.apply_verified(message, submitted_at_ms)?);
+        }
+
+        self.record_accepted_submission(submitted_at_ms);
+        self.accepted_submission_ids
+            .insert(submission_id.to_owned(), submitted_at_ms);
+
+        Ok(AggregateIngestResult::applied_many(applied_messages))
     }
 
     /// Replays a persisted signed submission without counting already-applied
@@ -471,6 +506,33 @@ impl AggregateStore {
         }
 
         self.apply_verified(message, submitted_at_ms)?;
+        self.record_accepted_submission(submitted_at_ms);
+        self.accepted_submission_ids
+            .insert(submission_id.to_owned(), submitted_at_ms);
+        Ok(true)
+    }
+
+    /// Replays a persisted signed frame-record batch without counting
+    /// already-applied entries as live duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch is invalid or decoded feed messages do not
+    /// carry receiver identity.
+    pub fn replay_verified_frame_records_submission(
+        &mut self,
+        submission_id: &str,
+        batch: &FrameRecordBatch,
+        submitted_at_ms: u64,
+    ) -> Result<bool, AggregateStoreError> {
+        if self.accepted_submission_ids.contains_key(submission_id) {
+            return Ok(false);
+        }
+
+        for message in Self::feed_messages_from_frame_batch(batch, submitted_at_ms)? {
+            self.apply_verified(message, submitted_at_ms)?;
+        }
+        self.record_accepted_submission(submitted_at_ms);
         self.accepted_submission_ids
             .insert(submission_id.to_owned(), submitted_at_ms);
         Ok(true)
@@ -484,6 +546,27 @@ impl AggregateStore {
     #[must_use]
     pub fn has_accepted_submission_id(&self, submission_id: &str) -> bool {
         self.accepted_submission_ids.contains_key(submission_id)
+    }
+
+    fn feed_messages_from_frame_batch(
+        batch: &FrameRecordBatch,
+        submitted_at_ms: u64,
+    ) -> Result<Vec<FeedMessage>, AggregateStoreError> {
+        batch
+            .validate()
+            .map_err(|error| AggregateStoreError::InvalidFrameRecords(error.to_string()))?;
+
+        let initial_now_ms = batch
+            .records
+            .first()
+            .map_or(submitted_at_ms, |record| record.now_ms);
+        let mut replay_config = FrameReplayConfig::new(batch.protocol, initial_now_ms);
+        replay_config.receiver_identity = Some(batch.receiver.clone());
+        replay_config.receiver_site = batch.receiver_site();
+
+        replay_frame_records(&batch.records, &replay_config)
+            .map(|messages| messages.into_iter().skip(1).collect())
+            .map_err(|error| AggregateStoreError::InvalidFrameRecords(error.to_string()))
     }
 
     fn apply_verified(
@@ -525,10 +608,13 @@ impl AggregateStore {
             }
         }
 
+        Ok(message)
+    }
+
+    fn record_accepted_submission(&mut self, submitted_at_ms: u64) {
         self.submissions_accepted = self.submissions_accepted.saturating_add(1);
         self.last_submission_ms = Some(submitted_at_ms);
         self.last_error = None;
-        Ok(message)
     }
 
     pub fn record_rejection(&mut self, error: impl Into<String>) {
@@ -793,22 +879,34 @@ impl std::error::Error for AggregateStorePersistenceError {}
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregateIngestResult {
     pub message: Option<FeedMessage>,
+    pub messages: Vec<FeedMessage>,
     pub duplicate: bool,
 }
 
 impl AggregateIngestResult {
     #[must_use]
-    pub const fn applied(message: FeedMessage) -> Self {
+    pub fn applied(message: FeedMessage) -> Self {
         Self {
-            message: Some(message),
+            message: Some(message.clone()),
+            messages: vec![message],
             duplicate: false,
         }
     }
 
     #[must_use]
-    pub const fn duplicate() -> Self {
+    pub fn applied_many(messages: Vec<FeedMessage>) -> Self {
+        Self {
+            message: messages.first().cloned(),
+            messages,
+            duplicate: false,
+        }
+    }
+
+    #[must_use]
+    pub fn duplicate() -> Self {
         Self {
             message: None,
+            messages: Vec::new(),
             duplicate: true,
         }
     }
@@ -817,6 +915,7 @@ impl AggregateIngestResult {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AggregateStoreError {
     MissingReceiver,
+    InvalidFrameRecords(String),
 }
 
 impl fmt::Display for AggregateStoreError {
@@ -824,6 +923,9 @@ impl fmt::Display for AggregateStoreError {
         match self {
             Self::MissingReceiver => {
                 formatter.write_str("feed message is missing receiver identity")
+            }
+            Self::InvalidFrameRecords(error) => {
+                write!(formatter, "invalid frame records: {error}")
             }
         }
     }
@@ -897,7 +999,7 @@ impl ReceiverAggregate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ReceiverHandle;
+    use crate::{Frame, FrameRecord, FrameRecordBatch, ReceiverHandle};
 
     #[test]
     fn aggregate_api_schema_describes_aggregate_contract() {
@@ -1031,6 +1133,32 @@ mod tests {
         assert!(duplicate.message.is_none());
         assert_eq!(status.submissions_accepted, 1);
         assert_eq!(status.submissions_duplicate, 1);
+        assert_eq!(store.snapshot(140).aircraft.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_store_ingests_verified_frame_record_batch() {
+        let mut store = AggregateStore::new();
+        let receiver = receiver("sf-a");
+        let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+        let record = FrameRecord::new(100, 0, &frame).with_receiver(Some(receiver.clone()));
+        let batch = FrameRecordBatch::new(Protocol::Adsb1090, receiver, vec![record]);
+
+        let first = store
+            .ingest_verified_frame_records_submission("submission-1", &batch, 110)
+            .unwrap();
+        let duplicate = store
+            .ingest_verified_frame_records_submission("submission-1", &batch, 120)
+            .unwrap();
+        let status = store.status(140, 40, 0);
+
+        assert!(!first.duplicate);
+        assert_eq!(first.messages.len(), 1);
+        assert!(duplicate.duplicate);
+        assert!(duplicate.messages.is_empty());
+        assert_eq!(status.submissions_accepted, 1);
+        assert_eq!(status.submissions_duplicate, 1);
+        assert_eq!(status.receivers[0].messages_accepted, 1);
         assert_eq!(store.snapshot(140).aircraft.len(), 1);
     }
 

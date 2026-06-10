@@ -222,10 +222,10 @@ impl RadioFeedDecoder for ModesAircraftFeedDecoder<'_> {
     fn decode_chunk(&mut self, data: &[u8], counters: &mut FeedCounters) -> Vec<FeedMessage> {
         let mut messages = Vec::new();
 
-        for (_, frame) in self.frames.decode_chunk(data) {
+        for decoded in self.frames.decode_chunk(data) {
             counters.decoded_frames += 1;
             let now_ms = crate::unix_time_ms();
-            let Some(snapshot) = self.store.update_frame(&frame, now_ms) else {
+            let Some(snapshot) = self.store.update_frame(&decoded.frame, now_ms) else {
                 continue;
             };
 

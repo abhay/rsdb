@@ -1,7 +1,7 @@
 use rsdb::{
     AircraftSnapshot, AircraftStore, CodeCount, DecodeStatus, FRAME_RECORD_SCHEMA_VERSION,
-    FeedMessage, Frame, FrameRecord, FrameRecordError, FrameReplayConfig, NameCount, Protocol,
-    ReceiverIdentity, ReceiverSite, audit_frame_records, replay_frame_records,
+    FeedMessage, Frame, FrameRecord, FrameRecordError, FrameReplayConfig, FrameSignalMetrics,
+    NameCount, Protocol, ReceiverIdentity, ReceiverSite, audit_frame_records, replay_frame_records,
 };
 
 const SFO_LIVE_FRAMES: &str = include_str!("fixtures/sfo-live-frames.txt");
@@ -18,6 +18,21 @@ fn frame_record_round_trips_raw_frame_metadata() {
     assert_eq!(record.protocol, Protocol::Adsb1090);
     assert_eq!(record.now_ms, START_MS);
     assert_eq!(record.sample_index, 123);
+    assert_eq!(record.frame_sequence, None);
+    assert_eq!(record.stream_start_ms, None);
+    assert_eq!(record.rx_elapsed_ns, Some(61_500));
+    assert_eq!(record.rx_timestamp_uncertainty_ns_estimate, Some(500));
+    assert_eq!(
+        record.center_frequency_hz,
+        Protocol::Adsb1090.default_center_frequency_hz()
+    );
+    assert_eq!(
+        record.sample_rate_hz,
+        Protocol::Adsb1090.default_sample_rate_hz()
+    );
+    assert_eq!(record.signal, None);
+    assert_eq!(record.icao.as_deref(), Some("A062EF"));
+    assert_eq!(record.adsb_type_code, Some(19));
     assert_eq!(record.raw, "8DA062EF9910B19A38040ACE2B14");
     assert_eq!(record.downlink_format, 17);
     assert_eq!(record.bit_len, 112);
@@ -56,6 +71,70 @@ fn rejects_non_modes_frame_record_protocol() {
     assert_eq!(
         record.parse_frame().unwrap_err(),
         FrameRecordError::UnsupportedProtocol(Protocol::Uat978)
+    );
+}
+
+#[test]
+fn rejects_frame_record_metadata_mismatch() {
+    let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+    let mut record = FrameRecord::new(START_MS, 0, &frame);
+    record.downlink_format = 18;
+
+    assert!(matches!(
+        record.parse_frame().unwrap_err(),
+        FrameRecordError::MetadataMismatch {
+            field: "downlink_format",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejects_frame_record_invalid_signal_metrics() {
+    let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+    let mut record = FrameRecord::new(START_MS, 0, &frame);
+    record.signal = Some(FrameSignalMetrics {
+        signal_power: 4_096,
+        noise_power: 16,
+        signal_dbfs_estimate: Some(-9.0),
+        snr_db_estimate: Some(24.0),
+        chunk_noise_power: Some(16),
+        beast_signal_level: 90,
+        preamble_high_avg: 4_096,
+        preamble_low_avg: 16,
+        preamble_delta: 1,
+        bit_margin_min: 4_080,
+        bit_margin_mean: 4_080,
+    });
+
+    assert!(matches!(
+        record.parse_frame().unwrap_err(),
+        FrameRecordError::MetadataMismatch {
+            field: "signal.preamble_delta",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn replay_rejects_frame_sequence_regression() {
+    let mut records = fixture_frame_records();
+    records[0].frame_sequence = Some(2);
+    records[1].frame_sequence = Some(1);
+
+    let error = replay_frame_records(
+        &records,
+        &FrameReplayConfig::new(Protocol::Adsb1090, START_MS),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        FrameRecordError::SequenceRegression {
+            field: "frame_sequence",
+            previous: 2,
+            actual: 1,
+        }
     );
 }
 

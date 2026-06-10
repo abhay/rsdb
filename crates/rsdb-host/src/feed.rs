@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AircraftSnapshot, AircraftStore, FrameRecord, FrameRecordError, Protocol, RadioConfig,
-    ReceiverHandle, ReceiverSite, SubmissionHealth, SubmissionStatus,
+    AircraftSnapshot, AircraftStore, FrameRecord, FrameRecordError, FrameRecordSequenceValidator,
+    Protocol, RadioConfig, ReceiverHandle, ReceiverSite, SubmissionHealth, SubmissionStatus,
 };
 
 /// Current JSON feed schema version.
@@ -1148,6 +1148,7 @@ pub fn replay_frame_records(
     let mut last_heartbeat_ms = config.initial_now_ms;
     let receiver_identity = config.receiver_identity.clone();
     let receiver_site = config.receiver_site.as_ref();
+    let mut sequence_validator = FrameRecordSequenceValidator::default();
     let mut messages = vec![
         FeedMessage::snapshot_for_protocol(
             config.protocol,
@@ -1158,6 +1159,7 @@ pub fn replay_frame_records(
     ];
 
     for record in records {
+        sequence_validator.validate_next(record)?;
         record.validate_protocol(config.protocol)?;
         let snapshot = store.update_frame_record(record)?;
         counters.decoded_frames += 1;

@@ -4,7 +4,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{FEED_SCHEMA_VERSION, FeedMessage};
+use crate::{
+    FEED_SCHEMA_VERSION, FRAME_RECORD_BATCH_SCHEMA_VERSION, FeedMessage, FrameRecordBatch,
+    ReceiverIdentity,
+};
 
 pub const SIGNED_SUBMISSION_SCHEMA_VERSION: u32 = 1;
 const ED25519_PUBLIC_KEY_BYTES: usize = 32;
@@ -58,6 +61,37 @@ impl SubmissionSigner {
         payload: FeedMessage,
         submitted_at_ms: u64,
     ) -> Result<SignedSubmission, SubmissionSigningError> {
+        self.sign_payload(payload, submitted_at_ms)
+    }
+
+    /// Signs a receiver-attributed frame-record batch as a submission envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload is missing receiver identity, has a
+    /// different receiver ID than this signer, or cannot be serialized for
+    /// signing.
+    pub fn sign_frame_records(
+        &self,
+        payload: FrameRecordBatch,
+        submitted_at_ms: u64,
+    ) -> Result<SignedSubmission, SubmissionSigningError> {
+        self.sign_payload(payload, submitted_at_ms)
+    }
+
+    /// Signs a receiver-attributed submission payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload is missing receiver identity, has a
+    /// different receiver ID than this signer, or cannot be serialized for
+    /// signing.
+    pub fn sign_payload(
+        &self,
+        payload: impl Into<SubmissionPayload>,
+        submitted_at_ms: u64,
+    ) -> Result<SignedSubmission, SubmissionSigningError> {
+        let payload = payload.into();
         let payload_receiver = payload
             .receiver()
             .ok_or(SubmissionSigningError::MissingPayloadReceiver)?;
@@ -133,8 +167,88 @@ pub struct SignedSubmission {
     pub receiver_id: String,
     pub algorithm: SignatureAlgorithm,
     pub submitted_at_ms: u64,
-    pub payload: FeedMessage,
+    pub payload: SubmissionPayload,
     pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+pub enum SubmissionPayload {
+    FeedMessage(FeedMessage),
+    FrameRecords(FrameRecordBatch),
+}
+
+impl SubmissionPayload {
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::FeedMessage(message) => match message {
+                FeedMessage::Snapshot { .. } => "snapshot",
+                FeedMessage::Aircraft { .. } => "aircraft",
+                FeedMessage::StaleAircraft { .. } => "stale_aircraft",
+                FeedMessage::Heartbeat { .. } => "heartbeat",
+            },
+            Self::FrameRecords(_) => "frame_records",
+        }
+    }
+
+    #[must_use]
+    pub fn schema_version(&self) -> u32 {
+        match self {
+            Self::FeedMessage(message) => message.schema_version(),
+            Self::FrameRecords(batch) => batch.schema_version(),
+        }
+    }
+
+    #[must_use]
+    pub const fn expected_schema_version(&self) -> u32 {
+        match self {
+            Self::FeedMessage(_) => FEED_SCHEMA_VERSION,
+            Self::FrameRecords(_) => FRAME_RECORD_BATCH_SCHEMA_VERSION,
+        }
+    }
+
+    #[must_use]
+    pub fn is_supported_schema_version(&self) -> bool {
+        match self {
+            Self::FeedMessage(message) => message.is_supported_schema_version(),
+            Self::FrameRecords(batch) => batch.is_supported_schema_version(),
+        }
+    }
+
+    #[must_use]
+    pub fn receiver(&self) -> Option<&ReceiverIdentity> {
+        match self {
+            Self::FeedMessage(message) => message.receiver(),
+            Self::FrameRecords(batch) => Some(&batch.receiver),
+        }
+    }
+
+    /// Validates the payload body after envelope-level schema checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a frame-record batch has invalid schema, receiver,
+    /// protocol, frame metadata, timing, signal, or sequence fields.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::FeedMessage(_) => Ok(()),
+            Self::FrameRecords(batch) => batch.validate().map_err(|error| error.to_string()),
+        }
+    }
+}
+
+impl From<FeedMessage> for SubmissionPayload {
+    fn from(message: FeedMessage) -> Self {
+        Self::FeedMessage(message)
+    }
+}
+
+impl From<FrameRecordBatch> for SubmissionPayload {
+    fn from(batch: FrameRecordBatch) -> Self {
+        Self::FrameRecords(batch)
+    }
 }
 
 impl SignedSubmission {
@@ -142,16 +256,17 @@ impl SignedSubmission {
     ///
     /// # Panics
     ///
-    /// Panics if the feed payload cannot be serialized while deriving the
+    /// Panics if the submission payload cannot be serialized while deriving the
     /// deterministic submission ID.
     #[must_use]
     pub fn new_ed25519(
         receiver_id: String,
         submitted_at_ms: u64,
-        payload: FeedMessage,
+        payload: impl Into<SubmissionPayload>,
         signature: String,
     ) -> Self {
         let algorithm = SignatureAlgorithm::Ed25519;
+        let payload = payload.into();
         let submission_id = submission_id_for(
             SIGNED_SUBMISSION_SCHEMA_VERSION,
             &receiver_id,
@@ -159,7 +274,7 @@ impl SignedSubmission {
             submitted_at_ms,
             &payload,
         )
-        .expect("feed message serialization cannot fail");
+        .expect("submission payload serialization cannot fail");
 
         Self {
             schema_version: SIGNED_SUBMISSION_SCHEMA_VERSION,
@@ -240,10 +355,14 @@ impl ReceiverAllowlist {
             return Err(
                 SubmissionVerificationError::UnsupportedPayloadSchemaVersion {
                     actual: submission.payload.schema_version(),
-                    expected: FEED_SCHEMA_VERSION,
+                    expected: submission.payload.expected_schema_version(),
                 },
             );
         }
+        submission
+            .payload
+            .validate()
+            .map_err(SubmissionVerificationError::InvalidPayload)?;
 
         let payload_receiver = submission
             .payload
@@ -304,6 +423,7 @@ pub enum SubmissionVerificationError {
         envelope_receiver_id: String,
         payload_receiver_id: String,
     },
+    InvalidPayload(String),
     SubmissionIdMismatch {
         submission_id: String,
         expected_submission_id: String,
@@ -380,6 +500,9 @@ impl fmt::Display for SubmissionVerificationError {
                 formatter,
                 "payload receiver_id {payload_receiver_id} does not match envelope receiver_id {envelope_receiver_id}"
             ),
+            Self::InvalidPayload(error) => {
+                write!(formatter, "invalid submission payload: {error}")
+            }
             Self::SubmissionIdMismatch {
                 submission_id,
                 expected_submission_id,
@@ -426,7 +549,7 @@ struct SubmissionSigningPayload<'a> {
     receiver_id: &'a str,
     algorithm: SignatureAlgorithm,
     submitted_at_ms: u64,
-    payload: &'a FeedMessage,
+    payload: &'a SubmissionPayload,
 }
 
 #[derive(Serialize)]
@@ -435,7 +558,7 @@ struct SubmissionIdPayload<'a> {
     receiver_id: &'a str,
     algorithm: SignatureAlgorithm,
     submitted_at_ms: u64,
-    payload: &'a FeedMessage,
+    payload: &'a SubmissionPayload,
 }
 
 impl SignedSubmission {
@@ -455,7 +578,7 @@ fn submission_id_for(
     receiver_id: &str,
     algorithm: SignatureAlgorithm,
     submitted_at_ms: u64,
-    payload: &FeedMessage,
+    payload: &SubmissionPayload,
 ) -> Result<String, serde_json::Error> {
     let encoded = serde_json::to_vec(&SubmissionIdPayload {
         schema_version,
@@ -566,7 +689,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::*;
-    use crate::{FeedMessage, ReceiverIdentity};
+    use crate::{FeedMessage, Frame, FrameRecord, FrameRecordBatch, Protocol, ReceiverIdentity};
 
     #[test]
     fn verifies_signed_submission() {
@@ -590,6 +713,24 @@ mod tests {
 
         assert_eq!(submission.receiver_id, signer.receiver_id());
         assert_eq!(submission.submission_id.len(), 64);
+        assert_eq!(allowlist.verify_submission(&submission), Ok(()));
+    }
+
+    #[test]
+    fn submission_signer_signs_frame_record_batch() {
+        let signer = SubmissionSigner::from_ed25519_secret_hex(
+            "0707070707070707070707070707070707070707070707070707070707070707",
+        )
+        .unwrap();
+        let receiver = ReceiverIdentity::new(signer.receiver_id().to_owned());
+        let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+        let record = FrameRecord::new(42, 0, &frame).with_receiver(Some(receiver.clone()));
+        let batch = FrameRecordBatch::new(Protocol::Adsb1090, receiver, vec![record]);
+
+        let submission = signer.sign_frame_records(batch, 1_717_000_000_000).unwrap();
+        let allowlist = ReceiverAllowlist::new(vec![signer.public_key_hex()]);
+
+        assert_eq!(submission.payload.kind(), "frame_records");
         assert_eq!(allowlist.verify_submission(&submission), Ok(()));
     }
 
@@ -645,7 +786,9 @@ mod tests {
         let mut submission = signed_submission(&signing_key);
         let allowlist = allowlist_for(&signing_key);
 
-        if let FeedMessage::Snapshot { now_ms, .. } = &mut submission.payload {
+        if let SubmissionPayload::FeedMessage(FeedMessage::Snapshot { now_ms, .. }) =
+            &mut submission.payload
+        {
             *now_ms += 1;
         }
 
@@ -694,7 +837,7 @@ mod tests {
     fn rejects_missing_payload_receiver() {
         let signing_key = sample_signing_key();
         let mut submission = signed_submission(&signing_key);
-        submission.payload = FeedMessage::snapshot(42, Vec::new());
+        submission.payload = FeedMessage::snapshot(42, Vec::new()).into();
         submission.signature = signature_hex(&signing_key, &submission);
         let allowlist = allowlist_for(&signing_key);
 

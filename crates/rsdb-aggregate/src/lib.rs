@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rsdb::{
     AggregateIngestResult, AggregatePersistenceStatus, AggregateStore, AggregateStorePersistence,
-    FeedMessage, ReceiverAllowlist, ReceiverIdentity, SignedSubmission,
+    FeedMessage, ReceiverAllowlist, ReceiverIdentity, SignedSubmission, SubmissionPayload,
 };
 use serde::Serialize;
 
@@ -295,26 +295,22 @@ fn unix_time_ms() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-fn feed_message_kind(message: &FeedMessage) -> &'static str {
-    match message {
-        FeedMessage::Snapshot { .. } => "snapshot",
-        FeedMessage::Aircraft { .. } => "aircraft",
-        FeedMessage::StaleAircraft { .. } => "stale_aircraft",
-        FeedMessage::Heartbeat { .. } => "heartbeat",
-    }
-}
-
 fn verified_submission_payload(
     allowlist: &ReceiverAllowlist,
     submission: &SignedSubmission,
-) -> Result<FeedMessage, String> {
+) -> Result<SubmissionPayload, String> {
     allowlist
         .verify_submission(submission)
         .map_err(|error| error.to_string())?;
-    Ok(submission
-        .payload
-        .clone()
-        .with_receiver(Some(ReceiverIdentity::new(submission.receiver_id.clone()))))
+    Ok(match submission.payload.clone() {
+        SubmissionPayload::FeedMessage(message) => SubmissionPayload::FeedMessage(
+            message.with_receiver(Some(ReceiverIdentity::new(submission.receiver_id.clone()))),
+        ),
+        SubmissionPayload::FrameRecords(mut batch) => {
+            batch.receiver = ReceiverIdentity::new(submission.receiver_id.clone());
+            SubmissionPayload::FrameRecords(batch)
+        }
+    })
 }
 
 fn websocket_accept_key(key: &str) -> String {
@@ -573,19 +569,19 @@ impl AggregatePersistence {
             let payload = verified_submission_payload(allowlist, submission).map_err(|error| {
                 format!("{}:{}: {error}", self.submissions_path.display(), index + 1)
             })?;
-            store
-                .replay_verified_submission(
-                    &submission.submission_id,
-                    payload,
-                    submission.submitted_at_ms,
+            replay_verified_payload(
+                store,
+                &submission.submission_id,
+                payload,
+                submission.submitted_at_ms,
+            )
+            .map_err(|error| {
+                format!(
+                    "{}:{}: invalid submission payload: {error}",
+                    self.submissions_path.display(),
+                    index + 1
                 )
-                .map_err(|error| {
-                    format!(
-                        "{}:{}: invalid submission payload: {error}",
-                        self.submissions_path.display(),
-                        index + 1
-                    )
-                })?;
+            })?;
         }
 
         Ok(())
@@ -967,7 +963,7 @@ enum WriterCommand {
     Submit {
         submission_id: String,
         submission: SignedSubmission,
-        payload: FeedMessage,
+        payload: SubmissionPayload,
         submitted_at_ms: u64,
         reply: mpsc::Sender<Result<AggregateIngestResult, SubmitError>>,
     },
@@ -1026,7 +1022,7 @@ fn writer_submit(
     persistence_status: &Mutex<AggregatePersistenceStatus>,
     submission_id: &str,
     submission: &SignedSubmission,
-    payload: FeedMessage,
+    payload: SubmissionPayload,
     submitted_at_ms: u64,
 ) -> Result<AggregateIngestResult, SubmitError> {
     let is_new_submission = !store
@@ -1039,14 +1035,45 @@ fn writer_submit(
     }
 
     let mut store = store.write().expect("aggregate store rwlock not poisoned");
-    let ingest = store
-        .ingest_verified_submission(submission_id, payload, submitted_at_ms)
+    let ingest = ingest_verified_payload(&mut store, submission_id, payload, submitted_at_ms)
         .map_err(|error| SubmitError::InvalidPayload(error.to_string()))?;
     if !ingest.duplicate {
         maintain_persistence(persistence, persistence_status, &mut store);
     }
 
     Ok(ingest)
+}
+
+fn ingest_verified_payload(
+    store: &mut AggregateStore,
+    submission_id: &str,
+    payload: SubmissionPayload,
+    submitted_at_ms: u64,
+) -> Result<AggregateIngestResult, rsdb::AggregateStoreError> {
+    match payload {
+        SubmissionPayload::FeedMessage(message) => {
+            store.ingest_verified_submission(submission_id, message, submitted_at_ms)
+        }
+        SubmissionPayload::FrameRecords(batch) => {
+            store.ingest_verified_frame_records_submission(submission_id, &batch, submitted_at_ms)
+        }
+    }
+}
+
+fn replay_verified_payload(
+    store: &mut AggregateStore,
+    submission_id: &str,
+    payload: SubmissionPayload,
+    submitted_at_ms: u64,
+) -> Result<bool, rsdb::AggregateStoreError> {
+    match payload {
+        SubmissionPayload::FeedMessage(message) => {
+            store.replay_verified_submission(submission_id, message, submitted_at_ms)
+        }
+        SubmissionPayload::FrameRecords(batch) => {
+            store.replay_verified_frame_records_submission(submission_id, &batch, submitted_at_ms)
+        }
+    }
 }
 
 fn persist_submission(
@@ -1164,7 +1191,7 @@ impl Hub {
         let receiver_id = submission.receiver_id.clone();
         let submission_id = submission.submission_id.clone();
         let submitted_at_ms = submission.submitted_at_ms;
-        let payload_type = feed_message_kind(&payload).to_owned();
+        let payload_type = payload.kind().to_owned();
         let (reply, receiver) = mpsc::channel();
         self.writer
             .send(WriterCommand::Submit {
@@ -1179,7 +1206,7 @@ impl Hub {
             .recv()
             .map_err(|_| SubmitError::Writer("aggregate writer stopped".to_owned()))??;
 
-        if let Some(message) = &ingest.message {
+        for message in &ingest.messages {
             self.broadcast(message);
         }
 
@@ -1325,7 +1352,7 @@ mod tests {
     use std::fs;
 
     use ed25519_dalek::{Signer, SigningKey};
-    use rsdb::{FeedMessage, ReceiverIdentity};
+    use rsdb::{FeedMessage, Frame, FrameRecord, FrameRecordBatch, Protocol, ReceiverIdentity};
 
     use super::*;
 
@@ -1344,6 +1371,25 @@ mod tests {
         assert_eq!(response.submission_id, submission.submission_id);
         assert_eq!(response.receiver_id, receiver_id_for(&signing_key));
         assert_eq!(response.payload_type, "aircraft");
+        assert_eq!(hub.status_json().submissions_accepted, 1);
+        assert_eq!(hub.aircraft_json().aircraft.len(), 1);
+    }
+
+    #[test]
+    fn hub_accepts_allowlisted_frame_record_submission() {
+        let signing_key = sample_signing_key();
+        let hub = Hub::new(allowlist_for(&signing_key));
+        let submission = signed_frame_record_submission(&signing_key);
+
+        let response = hub
+            .submit(&serde_json::to_vec(&submission).unwrap())
+            .unwrap();
+
+        assert!(response.accepted);
+        assert!(!response.duplicate);
+        assert_eq!(response.submission_id, submission.submission_id);
+        assert_eq!(response.receiver_id, receiver_id_for(&signing_key));
+        assert_eq!(response.payload_type, "frame_records");
         assert_eq!(hub.status_json().submissions_accepted, 1);
         assert_eq!(hub.aircraft_json().aircraft.len(), 1);
     }
@@ -1551,7 +1597,8 @@ mod tests {
         let hub = Hub::new(allowlist_for(&signing_key));
         let mut submission = signed_submission(&signing_key);
         submission.payload = FeedMessage::stale_aircraft(101, "A00001".to_owned())
-            .with_receiver(Some(receiver(&signing_key)));
+            .with_receiver(Some(receiver(&signing_key)))
+            .into();
 
         let error = hub
             .submit(&serde_json::to_vec(&submission).unwrap())
@@ -1610,6 +1657,25 @@ mod tests {
             receiver_id_for(signing_key),
             submitted_at_ms,
             FeedMessage::aircraft(100, aircraft()).with_receiver(Some(receiver(signing_key))),
+            String::new(),
+        );
+        submission.signature = encode_hex(
+            &signing_key
+                .sign(&submission.signing_bytes().unwrap())
+                .to_bytes(),
+        );
+        submission
+    }
+
+    fn signed_frame_record_submission(signing_key: &SigningKey) -> SignedSubmission {
+        let receiver = receiver(signing_key);
+        let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+        let record = FrameRecord::new(100, 0, &frame).with_receiver(Some(receiver.clone()));
+        let batch = FrameRecordBatch::new(Protocol::Adsb1090, receiver, vec![record]);
+        let mut submission = SignedSubmission::new_ed25519(
+            receiver_id_for(signing_key),
+            unix_time_ms(),
+            batch,
             String::new(),
         );
         submission.signature = encode_hex(

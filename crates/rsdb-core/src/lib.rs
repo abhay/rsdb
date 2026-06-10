@@ -18,7 +18,7 @@ pub use adsb::{
 };
 pub use crc::{ModeSChecksum, crc24_modes};
 pub use demod::{
-    DecodedFrame, DemodConfig, LONG_FRAME_TOTAL_SAMPLES, MODES_SAMPLE_RATE_HZ,
+    DecodedFrame, DecodedFrameSignal, DemodConfig, LONG_FRAME_TOTAL_SAMPLES, MODES_SAMPLE_RATE_HZ,
     decode_frames_from_iq, decode_frames_from_magnitudes, unsigned_iq_to_magnitudes,
 };
 pub use frame::{DownlinkFormat, Frame, FrameError, FrameLength, IcaoAddress};

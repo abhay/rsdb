@@ -16,9 +16,15 @@ GET  /ws               WebSocket stream of verified FeedMessage values
 POST /submit           SignedSubmission ingest endpoint
 ```
 
-`POST /submit` accepts 1 JSON `SignedSubmission`. The aggregate checks the
-receiver public key allowlist, verifies the Ed25519 signature, checks the signed
-`submission_id`, dedupes by that ID, and returns `202` for accepted or duplicate
+`POST /submit` accepts 1 JSON `SignedSubmission`. Its `payload` may be a
+`FeedMessage` or a `FrameRecordBatch`. The aggregate checks the receiver public
+key allowlist, verifies the Ed25519 signature, validates the payload, checks the
+signed `submission_id`, dedupes by that ID, and returns `202` for accepted or
+duplicate submissions.
+
+Signed frame-record batches stay JSON on the wire. They are larger than a
+binary stream, but they keep submission logs inspectable, curl-friendly, and easy
+to replay. Binary receiver formats should be adapters that produce signed JSON
 submissions.
 
 ## Receiver Diagnostics Endpoints
@@ -86,8 +92,90 @@ schema_version
 protocol
 now_ms
 sample_index
+frame_sequence
+stream_start_ms
+rx_elapsed_ns
+rx_timestamp_uncertainty_ns_estimate
+receiver
+receiver_site
+center_frequency_hz
+sample_rate_hz
+gain_mode
+gain_tenth_db
+bias_t
+device_index
+tuner_name
+stream_id
+chunk_sequence
+chunk_sample_index
+dropped_samples_before
+clipped_sample_ratio
+dc_i_offset
+dc_q_offset
+signal.signal_power
+signal.noise_power
+signal.signal_dbfs_estimate
+signal.snr_db_estimate
+signal.chunk_noise_power
+signal.beast_signal_level
+signal.preamble_high_avg
+signal.preamble_low_avg
+signal.preamble_delta
+signal.bit_margin_min
+signal.bit_margin_mean
+icao
+adsb_type_code
 raw
 downlink_format
 bit_len
 crc_valid
 ```
+
+Signal fields are relative estimates from the RTL-SDR sample stream, not
+calibrated RF power measurements.
+
+Frame records are validated before replay. The validator rejects unsupported
+schema or protocol values, malformed raw frames, frame metadata that disagrees
+with `raw`, impossible radio/timing values, invalid signal fields, and sequence
+regressions within a stream.
+
+## Signed Frame Batches
+
+Raw-frame submissions wrap multiple decoded records under one receiver:
+
+```json
+{
+  "schema_version": 1,
+  "submission_id": "...",
+  "receiver_id": "ed25519-...",
+  "algorithm": "ed25519",
+  "submitted_at_ms": 1780891560000,
+  "payload": {
+    "schema_version": 1,
+    "protocol": "adsb1090",
+    "receiver": {
+      "id": "ed25519-..."
+    },
+    "records": [
+      {
+        "schema_version": 2,
+        "protocol": "adsb1090",
+        "now_ms": 1780891560000,
+        "sample_index": 0,
+        "center_frequency_hz": 1090000000,
+        "sample_rate_hz": 2000000,
+        "raw": "8DA062EF9910B19A38040ACE2B14",
+        "downlink_format": 17,
+        "bit_len": 112,
+        "crc_valid": true
+      }
+    ]
+  },
+  "signature": "..."
+}
+```
+
+The aggregate validates the batch schema, receiver ID, protocol, record
+metadata, and sequence fields before appending the accepted submission to disk.
+Decoded aircraft updates from the batch are broadcast as normal `FeedMessage`
+values on `/ws`.
