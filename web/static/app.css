@@ -425,108 +425,32 @@ h1 {
   line-height: 1.05;
 }
 
+.scope-title-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.cs-ephemeral-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border: 1px solid rgba(120, 150, 210, 0.32);
+  border-radius: 999px;
+  background: rgba(120, 150, 210, 0.1);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: help;
+  white-space: nowrap;
+}
+
 .scope-summary {
   margin: 4px 0 0;
   color: var(--muted);
   font-size: 12px;
-}
-
-.scope-controls {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.scope-canvas-wrap {
-  position: relative;
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-  background:
-    radial-gradient(circle at 50% 50%, #10191c 0%, #06090b 68%),
-    repeating-linear-gradient(0deg, transparent 0 39px, rgba(255, 255, 255, 0.018) 39px 40px),
-    repeating-linear-gradient(90deg, transparent 0 39px, rgba(255, 255, 255, 0.018) 39px 40px);
-}
-
-.map-base,
-.map-fallback,
-.map-scrim,
-.radar-canvas {
-  position: absolute;
-  inset: 0;
-}
-
-.map-base {
-  z-index: 0;
-}
-
-.maplibregl-map,
-.maplibregl-canvas-container,
-.maplibregl-canvas {
-  width: 100%;
-  height: 100%;
-}
-
-.map-fallback {
-  z-index: 1;
-  background:
-    radial-gradient(circle at 50% 50%, rgba(17, 29, 32, 0.95) 0%, rgba(6, 9, 11, 0.98) 70%),
-    repeating-linear-gradient(0deg, transparent 0 39px, rgba(255, 255, 255, 0.02) 39px 40px),
-    repeating-linear-gradient(90deg, transparent 0 39px, rgba(255, 255, 255, 0.02) 39px 40px);
-}
-
-.map-scrim {
-  z-index: 2;
-  pointer-events: none;
-  background: radial-gradient(circle at 50% 50%, rgba(6, 9, 11, 0.06), rgba(6, 9, 11, 0.5));
-}
-
-#scope-canvas,
-.radar-canvas {
-  z-index: 3;
-  display: block;
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  cursor: crosshair;
-  touch-action: manipulation;
-}
-
-.map-badge {
-  position: absolute;
-  z-index: 4;
-  bottom: 14px;
-  left: 50%;
-  transform: translateX(-50%);
-  padding: 6px 10px;
-  border: 1px solid rgba(224, 173, 91, 0.4);
-  border-radius: 6px;
-  background: rgba(16, 22, 26, 0.92);
-  color: var(--amber);
-  font-family: var(--mono);
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-.scope-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-height: 36px;
-  padding: 8px 12px;
-  border-top: 1px solid var(--line-strong);
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 12px;
-}
-
-.scope-footer span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .table-wrap {
@@ -983,17 +907,399 @@ h3 {
     box-shadow: none;
   }
 
-  .scope-head,
-  .scope-footer {
+  .scope-head {
     align-items: stretch;
     flex-direction: column;
   }
+}
 
-  .scope-controls {
-    justify-content: stretch;
-  }
+/* ======================================================================
+   CoverageScope — deck.gl 3D coverage visualization (center-panel).
+   Floating overlays sit on top of the full-bleed deck canvas, styled to match
+   rsdb's dark theme and center-panel structure.
+   ====================================================================== */
+.coverage-scope {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(1200px 800px at 60% 18%, #0b1322 0%, #05070d 62%, #03050a 100%);
+}
 
-  .scope-controls .segments {
-    width: 100%;
-  }
+/* Positioned container between the scope head and footer. Holds the deck host
+   plus every floating overlay; gives .cs-deck (inset:0) something to fill. */
+.cs-deck-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* deck.gl mounts its own <canvas> into this sized host (passed via parent:). */
+.cs-deck {
+  position: absolute;
+  inset: 0;
+  cursor: grab;
+}
+.cs-deck:active { cursor: grabbing; }
+.cs-deck canvas { display: block; outline: none; }
+
+/* Shared floating-panel chrome (rsdb-dark variant of the viz .overlay look). */
+.cs-overlay {
+  position: absolute;
+  z-index: 20;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: rgba(16, 22, 26, 0.86);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(12px) saturate(130%);
+  -webkit-backdrop-filter: blur(12px) saturate(130%);
+}
+
+/* Collapsible panel header (click to expand/collapse) */
+.cs-panel-head {
+  appearance: none;
+  -webkit-appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  margin: 0 0 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  cursor: pointer;
+  outline: none;
+}
+.cs-panel-head:hover { color: var(--muted); }
+.cs-panel-head:focus-visible {
+  border-radius: 6px;
+  outline: 1px solid rgba(121, 211, 239, 0.42);
+  outline-offset: 4px;
+}
+.cs-panel-head .cs-caret { font-size: 10px; line-height: 1; color: var(--muted); }
+.cs-overlay.is-collapsed .cs-panel-head { margin-bottom: 0; }
+.cs-controls.is-collapsed .cs-panel-body,
+.cs-legend.is-collapsed .cs-legend-body { display: none; }
+/* collapsed controls shrink to just the header pill */
+.cs-controls.is-collapsed { width: auto; padding-bottom: 9px; }
+
+/* Controls (top-right) */
+.cs-controls {
+  top: 10px;
+  right: 10px;
+  width: 204px;
+  padding: 9px 11px 11px;
+  max-height: calc(100% - 20px);
+  overflow-y: auto;
+}
+.cs-group { margin-bottom: 11px; }
+.cs-group:last-child { margin-bottom: 0; }
+.cs-group-label {
+  margin-bottom: 8px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.cs-slider-row { display: block; margin-bottom: 12px; }
+.cs-slider-row:last-child { margin-bottom: 0; }
+.cs-slider-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 12px;
+}
+.cs-val {
+  color: var(--blue);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+.coverage-scope input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  margin: 0;
+  border-radius: 3px;
+  background: rgba(224, 235, 226, 0.16);
+  outline: none;
+}
+.coverage-scope input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  border: 2px solid #06121b;
+  border-radius: 50%;
+  background: var(--blue);
+  box-shadow: 0 0 8px rgba(121, 211, 239, 0.6);
+  cursor: pointer;
+}
+.coverage-scope input[type="range"]::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border: 2px solid #06121b;
+  border-radius: 50%;
+  background: var(--blue);
+  box-shadow: 0 0 8px rgba(121, 211, 239, 0.6);
+  cursor: pointer;
+}
+.coverage-scope input[type="range"]:disabled { opacity: 0.4; }
+
+/* Segmented control (plane style) */
+.cs-segmented {
+  display: flex;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 8px;
+  background: rgba(224, 235, 226, 0.1);
+}
+.cs-segmented button {
+  flex: 1;
+  border: 0;
+  padding: 6px 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+.cs-segmented button:hover { color: var(--text); }
+.cs-segmented button.active {
+  color: var(--blue);
+  background: rgba(121, 211, 239, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(121, 211, 239, 0.35);
+}
+
+/* Layer toggle chips */
+.cs-toggle-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+.cs-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.cs-toggle:hover { background: rgba(255, 255, 255, 0.06); }
+.cs-toggle:focus-visible {
+  outline: 2px solid rgba(121, 211, 239, 0.62);
+  outline-offset: 2px;
+}
+.cs-toggle.on { border-color: rgba(121, 211, 239, 0.25); }
+.cs-box {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 1.5px solid var(--faint);
+  border-radius: 4px;
+}
+.cs-toggle.on .cs-box {
+  border-color: var(--blue);
+  background: var(--blue);
+}
+.cs-toggle.on .cs-box::after {
+  content: "";
+  position: absolute;
+  left: 3.5px;
+  top: 0.5px;
+  width: 4px;
+  height: 8px;
+  border: solid #06121b;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.cs-lbl {
+  color: var(--text);
+  font-size: 11.5px;
+}
+
+/* Altitude legend (bottom-right). Sits above the ~32px .cs-footer. */
+.cs-legend {
+  bottom: 44px;
+  right: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 11px;
+}
+.cs-legend-body {
+  display: flex;
+  gap: 10px;
+}
+.cs-ramp {
+  width: 13px;
+  height: 132px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 5px;
+}
+.cs-scale {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  height: 132px;
+  padding: 1px 0;
+}
+.cs-scale .cs-tick {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* Bottom-center analysis dock: Slice + Profile (pointer-through container) */
+.cs-analysis-dock {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+  justify-content: center;
+  max-width: calc(100% - 16px);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.cs-analysis-dock > .cs-overlay {
+  position: static;
+  min-width: 0;
+  max-width: 100%;
+  pointer-events: auto;
+}
+
+.cs-slice-head,
+.cs-profile-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.cs-slice-now,
+.cs-profile-now {
+  color: var(--blue);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* Slice (top-down cross-section) */
+.cs-slice-panel { width: 320px; padding: 12px 14px; }
+.cs-slice-body { display: flex; gap: 12px; align-items: stretch; }
+.cs-slice-canvas {
+  display: block;
+  width: 240px;
+  height: 240px;
+  flex: none;
+  border: 1px solid rgba(120, 150, 210, 0.14);
+  border-radius: 8px;
+  background: radial-gradient(circle at 50% 50%, #0a1018 0%, #05070d 80%);
+}
+.cs-slice-slider-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+/* Vertical altitude slider (out-specify the generic range rule above; high value at top). */
+.cs-slice-panel input[type="range"].cs-vslider {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 8px;
+  height: 240px;
+  margin: 0 auto;
+  padding: 0;
+}
+
+/* Profile (range x altitude) */
+.cs-profile { width: 320px; padding: 12px 14px 10px; }
+.cs-profile-svg { display: block; width: 100%; height: auto; cursor: ns-resize; }
+.cs-profile-svg .cs-pf-grid { stroke: rgba(120, 150, 210, 0.14); stroke-width: 1; }
+.cs-profile-svg .cs-pf-axis { stroke: rgba(120, 150, 210, 0.45); stroke-width: 1; }
+.cs-profile-svg .cs-pf-tick { fill: var(--muted); font-family: var(--mono); font-size: 8px; }
+.cs-profile-svg .cs-pf-axlabel { fill: var(--faint); font-size: 8px; letter-spacing: 0.08em; text-transform: uppercase; }
+.cs-profile-svg .cs-pf-area { fill: rgba(121, 211, 239, 0.16); stroke: none; }
+.cs-profile-svg .cs-pf-line { fill: none; stroke: var(--blue); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+.cs-profile-svg .cs-pf-vertex { fill: var(--blue); }
+.cs-profile-svg .cs-pf-nowmark { stroke: var(--gold); stroke-width: 1; stroke-dasharray: 3 3; }
+.cs-profile-svg .cs-pf-nowlbl { fill: var(--gold); font-family: var(--mono); font-size: 8px; }
+.cs-profile-svg .cs-pf-slice-guide { stroke: var(--gold); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.65; }
+.cs-profile-svg .cs-pf-slice-dot { fill: var(--gold); stroke: #06121b; stroke-width: 1; }
+.cs-profile-svg .cs-pf-slice-lbl { fill: var(--gold); font-family: var(--mono); font-size: 8px; }
+
+/* deck.gl tooltip skin (matches rsdb dark theme) */
+.coverage-scope .deck-tooltip {
+  font-family: var(--mono) !important;
+  font-size: 11.5px !important;
+  border: 1px solid var(--line-strong) !important;
+  border-radius: 8px !important;
+  background: rgba(10, 14, 22, 0.94) !important;
+  color: #eef3fb !important;
+  padding: 8px 10px !important;
+  line-height: 1.55 !important;
+}
+.coverage-scope .deck-tooltip b { color: var(--blue); }
+
+/* Footer readout for the deck scene. */
+.cs-footer {
+  position: absolute;
+  z-index: 19;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 32px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--line-strong);
+  background: rgba(8, 12, 15, 0.72);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  pointer-events: none;
+}
+.cs-footer span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .cs-controls { width: 210px; }
+  .cs-legend .cs-ramp, .cs-legend .cs-scale { height: 110px; }
+  .cs-analysis-dock { gap: 8px; bottom: 42px; max-width: calc(100% - 16px); }
+  .cs-slice-panel { width: 250px; }
+  .cs-slice-canvas { width: 180px; height: 180px; }
+  .cs-slice-panel input[type="range"].cs-vslider { height: 180px; }
+  .cs-profile { width: 240px; }
 }

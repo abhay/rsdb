@@ -9,7 +9,9 @@
     "hooks:install": "lefthook install"
   },
   "dependencies": {
-    "maplibre-gl": "4.7.1",
+    "@deck.gl/core": "9.3.3",
+    "@deck.gl/layers": "9.3.3",
+    "@deck.gl/mesh-layers": "9.3.3",
     "preact": "^10.29.2"
   },
   "devDependencies": {
