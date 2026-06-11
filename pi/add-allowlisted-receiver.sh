@@ -12,8 +12,13 @@ can include # comments.
 USAGE
 }
 
-if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "$#" -lt 2 ]; then
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     usage
+    exit 0
+fi
+
+if [ "$#" -lt 2 ]; then
+    usage >&2
     exit 1
 fi
 
@@ -81,6 +86,6 @@ sed 's/^/  - /' "$allowlist_path"
 
 cat <<EOF
 
-For Fly.io, copy this public allowlist into fly.toml:
-  RSDB_ALLOWLIST = '''$(tr '\n' ',' < "$allowlist_path" | sed 's/,$//')'''
+For Fly.io, commit $allowlist_path and redeploy. The Docker image copies this
+file into /etc/rsdb/allowlist.txt.
 EOF

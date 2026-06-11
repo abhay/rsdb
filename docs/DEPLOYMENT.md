@@ -37,12 +37,8 @@ a volume for hot aggregate state:
 fly volumes create rsdb_data --size 1 --region sjc
 ```
 
-Set the public receiver allowlist in `fly.toml`:
-
-```toml
-[env]
-  RSDB_ALLOWLIST = '''64 hex public key'''
-```
+Public receiver keys live in `deploy/fly/allowlist.txt`. Additions should come
+through PRs so the public allowlist is reviewed with the code.
 
 Deploy:
 
@@ -51,7 +47,8 @@ fly deploy
 ```
 
 The Fly service listens on internal port `8080`, serves HTTPS publicly, and
-stores hot aggregate state under `/data/aggregate`.
+stores hot aggregate state under `/data/aggregate`. The Docker image copies
+`deploy/fly/allowlist.txt` into `/etc/rsdb/allowlist.txt`.
 
 The shared RSDB aggregate is deployed as `rsdb-aggregate` and is served at:
 
@@ -74,42 +71,39 @@ curl -fsS https://rsdb.hackshare.com/status.json
 
 ## Multi-Receiver Onboarding
 
-Create a bundle for a receiver owner:
+Each receiver owner creates their own private seed locally and opens a PR with
+only the public key:
 
 ```sh
-RSDB_NEW_RECEIVER_LAT=37.753311 \
-RSDB_NEW_RECEIVER_LON=-122.447029 \
-./pi/create-receiver-node.sh https://your-aggregate.example.com
+RSDB_RECEIVER_LAT=37.753311 \
+RSDB_RECEIVER_LON=-122.447029 \
+./pi/init-receiver-node.sh https://rsdb.hackshare.com
 ```
 
-The script writes ignored local files under:
-
-```text
-pi/secrets/receivers/key-<public-key-prefix>/
-```
+The script writes ignored local files under `pi/secrets/`, updates the local
+`.env`, and prints a 64-hex public key. The private seed never needs to leave
+the receiver owner's machine.
 
 Files:
 
 ```text
-node.env              laptop-side node SSH/host settings
-receiver.seed        private Ed25519 signing seed
-receiver.env         Pi receiver env snippet
-allowlist-entry.txt  public Ed25519 key for the aggregate operator
+pi/secrets/receiver.seed         private Ed25519 signing seed
+pi/secrets/allowlist-entry.txt   public Ed25519 key for the aggregate operator
 ```
 
-Only share `allowlist-entry.txt`. Don't share `receiver.seed` or the node SSH
-private key.
+Open a PR adding the public key to:
 
-Merge public keys into an allowlist:
+```text
+deploy/fly/allowlist.txt
+```
+
+Maintainers can validate and sort additions with:
 
 ```sh
-./pi/add-allowlisted-receiver.sh \
-  deploy/fly/allowlist.txt \
-  pi/secrets/receivers/key-<public-key-prefix>/allowlist-entry.txt
+./pi/add-allowlisted-receiver.sh deploy/fly/allowlist.txt path/to/public-key-file
 ```
 
-For Fly.io, copy the resulting public keys into `RSDB_ALLOWLIST` in `fly.toml`
-and redeploy or restart.
+For Fly.io, merge the PR and redeploy.
 
 For a Pi-hosted aggregate:
 

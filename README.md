@@ -52,6 +52,9 @@ The hardware path keeps the USB SDR off your laptop and puts it on a Raspberry
 Pi receiver node. See [pi/README.md](pi/README.md) for the CLI-only flash,
 first-boot, and provisioning flow.
 
+To join the shared aggregate, see
+[Multi-Receiver Onboarding](docs/DEPLOYMENT.md#multi-receiver-onboarding).
+
 ## Aggregate Deployment
 
 The aggregate can run on the Pi for local viewing, or as a standalone service

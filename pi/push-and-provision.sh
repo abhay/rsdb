@@ -64,6 +64,19 @@ rsync -az --delete \
     --exclude pi/secrets \
     ./ "$target:~/rsdb/"
 
+if [ -n "${RSDB_RECEIVER_SEED_PATH:-}" ]; then
+    if [ ! -f "$RSDB_RECEIVER_SEED_PATH" ]; then
+        echo "missing receiver seed: $RSDB_RECEIVER_SEED_PATH" >&2
+        exit 1
+    fi
+
+    rsync -az \
+        -e "$ssh_cmd" \
+        "$RSDB_RECEIVER_SEED_PATH" \
+        "$target:/tmp/rsdb-receiver.seed"
+    $ssh_cmd "$target" 'sudo install -d -m 0755 /etc/rsdb && sudo install -m 0600 -o "$(id -un)" -g "$(id -gn)" /tmp/rsdb-receiver.seed /etc/rsdb/receiver.seed && rm -f /tmp/rsdb-receiver.seed'
+fi
+
 quoted_lat="$(shell_quote "$RSDB_RECEIVER_LAT")"
 quoted_lon="$(shell_quote "$RSDB_RECEIVER_LON")"
 remote_env="RSDB_RECEIVER_LAT=$quoted_lat RSDB_RECEIVER_LON=$quoted_lon"

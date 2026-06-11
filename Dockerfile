@@ -29,12 +29,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/rsdb-aggregate /usr/local/bin/rsdb-aggregate
+COPY deploy/fly/allowlist.txt /etc/rsdb/allowlist.txt
 
 ENV RSDB_AGGREGATE_HOST=0.0.0.0
 ENV RSDB_AGGREGATE_PORT=8080
 ENV RSDB_AGGREGATE_DATA_DIR=/data/aggregate
 ENV RSDB_AGGREGATE_RETENTION_HOURS=72
 ENV RSDB_AGGREGATE_HOT_MAX_MB=250
+ENV RSDB_ALLOWLIST=/etc/rsdb/allowlist.txt
 
 EXPOSE 8080
 CMD ["rsdb-aggregate", "serve"]

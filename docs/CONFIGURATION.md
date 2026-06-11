@@ -78,6 +78,7 @@ receiver is missing. It reports the error, emits heartbeats, and retries.
 ## Signing And Submission
 
 ```sh
+RSDB_RECEIVER_SEED_PATH=pi/secrets/receiver.seed
 RSDB_SIGNING_KEY_PATH=/etc/rsdb/receiver.seed
 RSDB_SUBMIT_URLS=http://127.0.0.1:8090
 RSDB_SUBMIT_RETRY_SECONDS=5
@@ -96,6 +97,11 @@ The outbox is durable. If an aggregate is unavailable, signed submissions remain
 queued and replay later. Submission IDs make replay idempotent at the aggregate.
 Aircraft data is submitted as signed frame batches; receiver health is submitted
 as signed heartbeat feed messages.
+
+`RSDB_RECEIVER_SEED_PATH` is a laptop-side deploy helper created by
+`pi/init-receiver-node.sh`. `pi/push-and-provision.sh` installs that local seed to
+`/etc/rsdb/receiver.seed` before provisioning the Pi. Runtime services use
+`RSDB_SIGNING_KEY_PATH` on the Pi.
 
 ## Aggregate Service
 

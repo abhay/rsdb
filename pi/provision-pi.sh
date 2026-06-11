@@ -228,6 +228,11 @@ if [ -n "${RSDB_SUBMIT_URLS:-}" ]; then
     set_config_key RSDB_SUBMIT_URLS "$RSDB_SUBMIT_URLS"
 fi
 
+if sudo test -f /etc/rsdb/receiver.seed; then
+    sudo chown "$USER:$USER" /etc/rsdb/receiver.seed
+    sudo chmod 0600 /etc/rsdb/receiver.seed
+fi
+
 if ! active_config_key RSDB_SIGNING_KEY_PATH; then
     if sudo test -f /etc/rsdb/receiver.seed; then
         ensure_active_config_key RSDB_SIGNING_KEY_PATH "RSDB_SIGNING_KEY_PATH=/etc/rsdb/receiver.seed"

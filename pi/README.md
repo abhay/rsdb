@@ -15,16 +15,24 @@ service verifies signed submissions and serves the UI/API on port `8090`.
 
 ## Local Settings
 
-Copy the example config and fill in the receiver fields from
-[../docs/CONFIGURATION.md](../docs/CONFIGURATION.md):
+Copy the example config and fill in `RSDB_RECEIVER_LAT` and
+`RSDB_RECEIVER_LON`:
 
 ```sh
 cp .env.example .env
 ```
 
-Required local values are `RSDB_NODE_HOSTNAME`, `RSDB_RECEIVER_LAT`, and
-`RSDB_RECEIVER_LON`. Add Wi-Fi fields only when the Pi can't use Ethernet or
-another preconfigured network.
+Then create the receiver identity locally:
+
+```sh
+./pi/init-receiver-node.sh
+```
+
+The init script creates `pi/secrets/receiver.seed`, updates `.env`, and prints
+the public key to add to `deploy/fly/allowlist.txt` in a PR.
+
+Add Wi-Fi fields only when the Pi can't use Ethernet or another preconfigured
+network.
 
 ## Create A Node SSH Key
 
