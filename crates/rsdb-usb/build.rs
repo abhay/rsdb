@@ -4,6 +4,10 @@ use std::process;
 use std::time::SystemTime;
 
 fn main() {
+    if std::env::var_os("RSDB_SKIP_WEB_BUNDLE_CHECK").is_some() {
+        return;
+    }
+
     println!("cargo:rerun-if-changed=../../package.json");
     println!("cargo:rerun-if-changed=../../bun.lock");
     println!("cargo:rerun-if-changed=../../tsconfig.json");

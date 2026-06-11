@@ -10,6 +10,7 @@ const EARTH_RADIUS_KM = 6371;
 const FIELD_RECENT_MS = 30 * 1000;
 const FIELD_STALE_MS = 2 * 60 * 1000;
 const RECEIVER_COLORS = ["#70d673", "#7fdcff", "#f7cb6f", "#e88a74", "#a78bfa", "#4cc8a3", "#f78fb3"];
+const REPOSITORY_URL = "https://github.com/abhay/rsdb";
 
 const EMPTY_STATUS = {
   receiver_connected: false,
@@ -264,8 +265,39 @@ function Header({ status, statusReachable, aircraftCount, nowMs, socketState }) 
           </div>
         ))}
       </section>
-      <span className={`connection-state connection-${socketState.toLowerCase()}`}>{socketState}</span>
+      <nav className="topbar-actions" aria-label="Project links">
+        <a className="topbar-link github-link" href={REPOSITORY_URL} target="_blank" rel="noreferrer" aria-label="RSDB on GitHub" title="RSDB on GitHub">
+          <GitHubIcon />
+        </a>
+        <a className="topbar-link agents-link" href="/agents.md" aria-label="Agent guide" title="Agent guide">
+          <RobotIcon />
+        </a>
+        <span className={`connection-state connection-${socketState.toLowerCase()}`}>{socketState}</span>
+      </nav>
     </header>
+  );
+}
+
+function RobotIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path className="robot-antenna" d="M12 4V2.5" />
+      <circle className="robot-dot" cx="12" cy="2.5" r="1" />
+      <rect className="robot-face" x="5" y="6" width="14" height="12" rx="3" />
+      <circle className="robot-eye" cx="9.5" cy="11.5" r="1.35" />
+      <circle className="robot-eye" cx="14.5" cy="11.5" r="1.35" />
+      <path className="robot-mouth" d="M9 15h6" />
+      <path className="robot-ear" d="M3.5 10v4" />
+      <path className="robot-ear" d="M20.5 10v4" />
+    </svg>
+  );
+}
+
+function GitHubIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <path fill="currentColor" d="M8 0C3.58 0 0 3.67 0 8.19c0 3.62 2.29 6.69 5.47 7.77.4.08.55-.18.55-.39v-1.53c-2.23.5-2.7-.97-2.7-.97-.36-.95-.89-1.2-.89-1.2-.73-.51.06-.5.06-.5.81.06 1.23.85 1.23.85.72 1.26 1.87.9 2.33.69.07-.53.28-.9.51-1.1-1.78-.21-3.64-.91-3.64-4.04 0-.89.31-1.62.82-2.2-.08-.21-.36-1.04.08-2.17 0 0 .68-.22 2.2.84A7.43 7.43 0 0 1 8 3.97c.68 0 1.36.09 2 .27 1.52-1.06 2.19-.84 2.19-.84.44 1.13.16 1.96.08 2.17.51.58.82 1.31.82 2.2 0 3.14-1.87 3.83-3.65 4.03.29.26.54.76.54 1.53v2.24c0 .21.14.47.55.39A8.08 8.08 0 0 0 16 8.19C16 3.67 12.42 0 8 0Z" />
+    </svg>
   );
 }
 

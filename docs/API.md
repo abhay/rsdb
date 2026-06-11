@@ -12,6 +12,9 @@ GET  /aircraft.json    Receiver-scoped aggregate aircraft snapshot
 GET  /bootstrap.json   Current snapshot plus recent feed messages
 GET  /receivers.json   Receiver summaries
 GET  /schema.json      Machine-readable endpoint and field contract
+GET  /agents.md        Agent-facing project guide generated from repo docs
+GET  /llms.txt         Same guide for clients that discover llms.txt
+GET  /robots.txt       Crawler policy for safe read-only endpoints
 GET  /ws               WebSocket stream of verified FeedMessage values
 POST /submit           SignedSubmission ingest endpoint
 ```

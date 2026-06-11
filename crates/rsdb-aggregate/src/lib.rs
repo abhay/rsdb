@@ -19,6 +19,19 @@ use serde::Serialize;
 const INDEX_HTML: &str = include_str!("../../../web/static/index.html");
 const APP_CSS: &str = include_str!("../../../web/static/app.css");
 const APP_JS: &str = include_str!("../../../web/dist/app.js");
+const AGENTS_MD: &str = include_str!("../../../web/static/agents.md");
+const ROBOTS_TXT: &str = "\
+User-agent: *
+Allow: /agents.md
+Allow: /AGENTS.md
+Allow: /llms.txt
+Allow: /schema.json
+Allow: /status.json
+Allow: /bootstrap.json
+Allow: /aircraft.json
+Allow: /receivers.json
+Disallow: /submit
+";
 const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 const AGGREGATE_CHECKPOINT_RECORDS: u64 = 250;
 const AGGREGATE_COMPACTION_TARGET_PERCENT: u64 = 80;
@@ -142,6 +155,22 @@ fn serve_http(mut stream: TcpStream, hub: &Hub, request: &HttpRequest) {
                 "200 OK",
                 "application/javascript; charset=utf-8",
                 APP_JS.as_bytes(),
+            );
+        }
+        ("GET" | "HEAD", "/agents.md" | "/AGENTS.md" | "/llms.txt") => {
+            let _ = write_response(
+                &mut stream,
+                "200 OK",
+                "text/markdown; charset=utf-8",
+                AGENTS_MD.as_bytes(),
+            );
+        }
+        ("GET" | "HEAD", "/robots.txt") => {
+            let _ = write_response(
+                &mut stream,
+                "200 OK",
+                "text/plain; charset=utf-8",
+                ROBOTS_TXT.as_bytes(),
             );
         }
         ("GET" | "HEAD", "/status.json") => {

@@ -129,7 +129,6 @@ h1 {
 }
 
 .connection-state {
-  justify-self: end;
   min-width: 94px;
   padding: 6px 9px;
   border: 1px solid var(--line-strong);
@@ -138,6 +137,74 @@ h1 {
   font-family: var(--mono);
   font-size: 12px;
   text-align: center;
+}
+
+.topbar-actions {
+  display: flex;
+  justify-self: end;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.topbar-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1;
+  text-decoration: none;
+  text-transform: uppercase;
+}
+
+.topbar-link:hover,
+.topbar-link:focus-visible {
+  color: var(--text);
+  border-color: rgba(121, 211, 239, 0.45);
+  outline: none;
+}
+
+.github-link {
+  padding: 0;
+}
+
+.github-link svg,
+.agents-link svg {
+  width: 16px;
+  height: 16px;
+}
+
+.agents-link {
+  padding: 0;
+  color: var(--blue);
+}
+
+.agents-link svg {
+  width: 18px;
+  height: 18px;
+}
+
+.robot-face,
+.robot-antenna,
+.robot-mouth,
+.robot-ear {
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.robot-dot,
+.robot-eye {
+  fill: currentColor;
 }
 
 .connection-connected {
@@ -877,6 +944,10 @@ h3 {
   }
 
   .connection-state {
+    flex: 1;
+  }
+
+  .topbar-actions {
     justify-self: stretch;
   }
 

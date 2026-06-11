@@ -70,6 +70,11 @@ setup.
 See [docs/API.md](docs/API.md) for the aggregate HTTP endpoints, WebSocket feed,
 receiver diagnostics endpoints, and replay file formats.
 
+The deployed aggregate also serves an agent-facing project guide at
+`/agents.md`, generated from the committed repo docs and agent rules. The same
+guide is available at `/llms.txt`, and `/robots.txt` allows those read-only
+agent endpoints while disallowing `/submit`.
+
 ## Architecture
 
 The short version:

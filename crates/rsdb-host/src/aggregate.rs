@@ -54,6 +54,24 @@ pub fn aggregate_api_schema() -> ApiSchema {
                 "Machine-readable aggregate endpoint and field contract.",
             ),
             aggregate_endpoint(
+                "/agents.md",
+                "GET",
+                "text/markdown",
+                "Agent-facing project guide generated from committed repository docs.",
+            ),
+            aggregate_endpoint(
+                "/llms.txt",
+                "GET",
+                "text/markdown",
+                "Agent-facing project guide alias for clients that discover llms.txt.",
+            ),
+            aggregate_endpoint(
+                "/robots.txt",
+                "GET",
+                "text/plain",
+                "Crawler policy that allows safe read-only agent endpoints and disallows submit.",
+            ),
+            aggregate_endpoint(
                 "/submit",
                 "POST",
                 "SubmitResponse",
@@ -1072,6 +1090,24 @@ mod tests {
                 .endpoints
                 .iter()
                 .any(|endpoint| { endpoint.path == "/bootstrap.json" && endpoint.method == "GET" })
+        );
+        assert!(
+            schema
+                .endpoints
+                .iter()
+                .any(|endpoint| { endpoint.path == "/agents.md" && endpoint.method == "GET" })
+        );
+        assert!(
+            schema
+                .endpoints
+                .iter()
+                .any(|endpoint| { endpoint.path == "/llms.txt" && endpoint.method == "GET" })
+        );
+        assert!(
+            schema
+                .endpoints
+                .iter()
+                .any(|endpoint| { endpoint.path == "/robots.txt" && endpoint.method == "GET" })
         );
         assert_eq!(schema.websocket.path, "/ws");
         assert!(
