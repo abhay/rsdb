@@ -453,104 +453,6 @@ h1 {
   font-size: 12px;
 }
 
-.scope-controls {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.scope-canvas-wrap {
-  position: relative;
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-  background:
-    radial-gradient(circle at 50% 50%, #10191c 0%, #06090b 68%),
-    repeating-linear-gradient(0deg, transparent 0 39px, rgba(255, 255, 255, 0.018) 39px 40px),
-    repeating-linear-gradient(90deg, transparent 0 39px, rgba(255, 255, 255, 0.018) 39px 40px);
-}
-
-.map-base,
-.map-fallback,
-.map-scrim,
-.radar-canvas {
-  position: absolute;
-  inset: 0;
-}
-
-.map-base {
-  z-index: 0;
-}
-
-.maplibregl-map,
-.maplibregl-canvas-container,
-.maplibregl-canvas {
-  width: 100%;
-  height: 100%;
-}
-
-.map-fallback {
-  z-index: 1;
-  background:
-    radial-gradient(circle at 50% 50%, rgba(17, 29, 32, 0.95) 0%, rgba(6, 9, 11, 0.98) 70%),
-    repeating-linear-gradient(0deg, transparent 0 39px, rgba(255, 255, 255, 0.02) 39px 40px),
-    repeating-linear-gradient(90deg, transparent 0 39px, rgba(255, 255, 255, 0.02) 39px 40px);
-}
-
-.map-scrim {
-  z-index: 2;
-  pointer-events: none;
-  background: radial-gradient(circle at 50% 50%, rgba(6, 9, 11, 0.06), rgba(6, 9, 11, 0.5));
-}
-
-#scope-canvas,
-.radar-canvas {
-  z-index: 3;
-  display: block;
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  cursor: crosshair;
-  touch-action: manipulation;
-}
-
-.map-badge {
-  position: absolute;
-  z-index: 4;
-  bottom: 14px;
-  left: 50%;
-  transform: translateX(-50%);
-  padding: 6px 10px;
-  border: 1px solid rgba(224, 173, 91, 0.4);
-  border-radius: 6px;
-  background: rgba(16, 22, 26, 0.92);
-  color: var(--amber);
-  font-family: var(--mono);
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-.scope-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  min-height: 36px;
-  padding: 8px 12px;
-  border-top: 1px solid var(--line-strong);
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 12px;
-}
-
-.scope-footer span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .table-wrap {
   flex: 1;
   min-height: 0;
@@ -1005,25 +907,16 @@ h3 {
     box-shadow: none;
   }
 
-  .scope-head,
-  .scope-footer {
+  .scope-head {
     align-items: stretch;
     flex-direction: column;
-  }
-
-  .scope-controls {
-    justify-content: stretch;
-  }
-
-  .scope-controls .segments {
-    width: 100%;
   }
 }
 
 /* ======================================================================
    CoverageScope — deck.gl 3D coverage visualization (center-panel).
-   Replaces the maplibre SpatialPanel. Floating overlays sit ON TOP of the
-   full-bleed deck canvas, styled to match rsdb's dark theme + .scope-panel.
+   Floating overlays sit on top of the full-bleed deck canvas, styled to match
+   rsdb's dark theme and center-panel structure.
    ====================================================================== */
 .coverage-scope {
   position: relative;
@@ -1066,6 +959,8 @@ h3 {
 
 /* Collapsible panel header (click to expand/collapse) */
 .cs-panel-head {
+  appearance: none;
+  -webkit-appearance: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1082,8 +977,14 @@ h3 {
   letter-spacing: 0.13em;
   text-transform: uppercase;
   cursor: pointer;
+  outline: none;
 }
 .cs-panel-head:hover { color: var(--muted); }
+.cs-panel-head:focus-visible {
+  border-radius: 6px;
+  outline: 1px solid rgba(121, 211, 239, 0.42);
+  outline-offset: 4px;
+}
 .cs-panel-head .cs-caret { font-size: 10px; line-height: 1; color: var(--muted); }
 .cs-overlay.is-collapsed .cs-panel-head { margin-bottom: 0; }
 .cs-controls.is-collapsed .cs-panel-body,
@@ -1199,9 +1100,16 @@ h3 {
   border: 1px solid transparent;
   border-radius: 7px;
   background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  font: inherit;
   text-align: left;
+  cursor: pointer;
 }
 .cs-toggle:hover { background: rgba(255, 255, 255, 0.06); }
+.cs-toggle:focus-visible {
+  outline: 2px solid rgba(121, 211, 239, 0.62);
+  outline-offset: 2px;
+}
 .cs-toggle.on { border-color: rgba(121, 211, 239, 0.25); }
 .cs-box {
   position: relative;
@@ -1359,7 +1267,7 @@ h3 {
 }
 .coverage-scope .deck-tooltip b { color: var(--blue); }
 
-/* Footer readout, mirroring rsdb's .scope-footer rhythm */
+/* Footer readout for the deck scene. */
 .cs-footer {
   position: absolute;
   z-index: 19;

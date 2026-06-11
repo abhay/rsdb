@@ -56,10 +56,10 @@ const RING_RADII = [25, 50, 100, 150, 200, 250];
 // The 7 layer-visibility chips (deck layers only; Profile/Slice are DOM panels).
 const LAYER_CHIPS = [
   ["cloud", "Coverage"],
-  ["planes", "Live planes"],
+  ["planes", "Planes"],
   ["trails", "Trails"],
-  ["rings", "Range rings"],
-  ["grid", "Ground grid"],
+  ["rings", "Rings"],
+  ["grid", "Grid"],
   ["basemap", "Map"],
   ["hull", "Hull"],
 ];
@@ -132,6 +132,20 @@ function numeric(value) {
 
 function hasPositionItem(item) {
   return numeric(item.lat) && numeric(item.lon);
+}
+
+function itemAltitudeFt(item) {
+  if (numeric(item.altitude_baro_ft)) return item.altitude_baro_ft;
+  if (numeric(item.altitude_geometric_ft)) return item.altitude_geometric_ft;
+  return 0;
+}
+
+function mergedItemTrail(item, trails) {
+  if (!trails?.get) return [];
+  return (item.source_keys ?? [item.key])
+    .flatMap((key) => trails.get(key) ?? [])
+    .filter((point) => numeric(point.lat) && numeric(point.lon))
+    .sort((left, right) => Number(left.time ?? 0) - Number(right.time ?? 0));
 }
 
 // ----------------------------------------------------------------------
@@ -402,6 +416,72 @@ function centroidOf(items) {
   return { lat: sumLat / n, lon: sumLon / n };
 }
 
+function validSite(site) {
+  return Boolean(site) && numeric(site.lat) && numeric(site.lon);
+}
+
+function siteCentroid(sites) {
+  if (sites.length === 0) return null;
+  const total = sites.reduce((sum, site) => ({
+    lat: sum.lat + site.lat,
+    lon: sum.lon + site.lon,
+  }), { lat: 0, lon: 0 });
+  return {
+    lat: total.lat / sites.length,
+    lon: total.lon / sites.length,
+  };
+}
+
+function anchorKey(prefix, site) {
+  return `${prefix}:${site.lat},${site.lon}`;
+}
+
+function resolveCoverageAnchor(receiverSite, receiverSites, focusReceiverId, items) {
+  if (focusReceiverId) {
+    const focused = receiverSites.find((entry) => entry.receiver?.id === focusReceiverId)?.site;
+    if (validSite(focused)) {
+      return {
+        origin: { lat: focused.lat, lon: focused.lon },
+        fixed: true,
+        key: anchorKey(`focus:${focusReceiverId}`, focused),
+        label: "Focused receiver origin",
+      };
+    }
+  }
+
+  const sites = receiverSites
+    .map((entry) => entry.site)
+    .filter(validSite);
+  if (sites.length > 0) {
+    const origin = siteCentroid(sites);
+    return {
+      origin,
+      fixed: true,
+      key: `receivers:${sites.map((site) => `${site.lat},${site.lon}`).sort().join("|")}`,
+      label: sites.length === 1 ? "Station origin" : "Network origin",
+    };
+  }
+
+  if (validSite(receiverSite)) {
+    return {
+      origin: { lat: receiverSite.lat, lon: receiverSite.lon },
+      fixed: true,
+      key: anchorKey("station", receiverSite),
+      label: "Station origin",
+    };
+  }
+
+  const centroid = centroidOf(items);
+  return centroid
+    ? {
+        origin: centroid,
+        fixed: false,
+        key: "aircraft-centroid",
+        label: "Centroid anchor",
+      }
+    : null;
+}
+
 // Haversine km (origin drift check).
 function haversineKm(lat1, lon1, lat2, lon2) {
   const R = 6371;
@@ -415,19 +495,22 @@ function haversineKm(lat1, lon1, lat2, lon2) {
 }
 
 // Fresh accumulator anchored at an origin (clears cloud/envelope/lastSeen/icaoSeen).
-function makeAccumulator(origin, fixed) {
+function makeAccumulator(anchor) {
   return {
-    origin: origin,
-    fixed: fixed,
-    enu: makeEnu(origin),
+    origin: anchor.origin,
+    fixed: anchor.fixed,
+    anchorKey: anchor.key,
+    anchorLabel: anchor.label,
+    enu: makeEnu(anchor.origin),
     cloud: new Float32Array(MAX_POINTS * 3), // [east, north, alt_ft] ring buffer
     cloudCount: 0, // number of valid slots filled
     cloudHead: 0, // next write index (wraps once full)
     cloudFull: false,
     lastSeen: new Map(), // icao -> { east, north, altFt, timeMs }
+    trailCursor: new Map(), // icao -> newest trail timestamp already seeded
     icaoSeen: new Set(),
     envelope: new Float32Array(ENV_ALT_LEVELS * ENV_BINS), // max range per [altLevel, bearingBin]
-    tiles: computeBasemapTiles(origin),
+    tiles: computeBasemapTiles(anchor.origin),
     maxRangeKm: 0,
     maxAltFt: 0,
   };
@@ -442,73 +525,93 @@ function bearingFromEnu(east, north) {
 
 // Run one accumulation pass over positioned items at time nowMs.
 // Returns true if the cloud or envelope changed (so a deck rebuild is warranted).
-function accumulate(acc, items, nowMs) {
+function accumulate(acc, items, trails, nowMs) {
   let changed = false;
   for (const item of items) {
     if (!hasPositionItem(item)) continue;
     const icao = item.icao;
     if (!icao) continue;
-    const enuPt = acc.enu(item.lon, item.lat);
-    const east = enuPt[0];
-    const north = enuPt[1];
-    const altFt = numeric(item.altitude_baro_ft)
-      ? item.altitude_baro_ft
-      : numeric(item.altitude_geometric_ft)
-        ? item.altitude_geometric_ft
-        : 0;
-    const time = numeric(item.position_last_seen_ms)
+    const altFt = itemAltitudeFt(item);
+    const trailCursor = acc.trailCursor.get(icao) ?? -Infinity;
+    let nextTrailCursor = trailCursor;
+
+    for (const point of mergedItemTrail(item, trails)) {
+      const pointTimeMs = numeric(point.time) ? point.time : 0;
+      if (pointTimeMs <= trailCursor) continue;
+      changed = accumulateSample(acc, icao, {
+        lat: point.lat,
+        lon: point.lon,
+        altFt,
+        timeMs: pointTimeMs,
+      }) || changed;
+      if (pointTimeMs > nextTrailCursor) nextTrailCursor = pointTimeMs;
+    }
+    if (nextTrailCursor > trailCursor) {
+      acc.trailCursor.set(icao, nextTrailCursor);
+    }
+
+    const timeMs = numeric(item.position_last_seen_ms)
       ? item.position_last_seen_ms
       : numeric(item.last_seen_ms)
         ? item.last_seen_ms
         : nowMs;
 
-    const prev = acc.lastSeen.get(icao);
-    let store = false;
-    if (!prev) {
-      store = true; // new icao
-    } else {
-      const movedKm = Math.hypot(east - prev.east, north - prev.north);
-      const altDelta = Math.abs(altFt - prev.altFt);
-      const elapsedMs = time - prev.timeMs;
-      if (movedKm >= ACC_MIN_MOVE_KM || altDelta >= ACC_MIN_ALT_FT || elapsedMs >= ACC_MIN_INTERVAL_MS) {
-        store = true;
-      }
-    }
-    if (!store) continue;
-
-    acc.lastSeen.set(icao, { east: east, north: north, altFt: altFt, timeMs: time });
-    acc.icaoSeen.add(icao);
-
-    // Append into the capped rolling cloud (ring buffer once full).
-    const slot = acc.cloudHead;
-    acc.cloud[slot * 3] = east;
-    acc.cloud[slot * 3 + 1] = north;
-    acc.cloud[slot * 3 + 2] = altFt;
-    acc.cloudHead = (acc.cloudHead + 1) % MAX_POINTS;
-    if (acc.cloudFull) {
-      // count stays at MAX_POINTS
-    } else if (acc.cloudHead === 0) {
-      acc.cloudFull = true;
-      acc.cloudCount = MAX_POINTS;
-    } else {
-      acc.cloudCount = acc.cloudHead;
-    }
-    changed = true;
-
-    // Update bearing x altitude envelope (max range per bin).
-    const rangeKm = Math.hypot(east, north);
-    if (rangeKm > acc.maxRangeKm) acc.maxRangeKm = rangeKm;
-    if (altFt > acc.maxAltFt) acc.maxAltFt = altFt;
-    let lvl = Math.round(altFt / ENV_ALT_STEP);
-    if (lvl < 0) lvl = 0;
-    if (lvl > ENV_ALT_LEVELS - 1) lvl = ENV_ALT_LEVELS - 1;
-    let bin = Math.floor(bearingFromEnu(east, north) / ENV_BIN_DEG);
-    if (bin < 0) bin = 0;
-    if (bin > ENV_BINS - 1) bin = ENV_BINS - 1;
-    const ei = lvl * ENV_BINS + bin;
-    if (rangeKm > acc.envelope[ei]) acc.envelope[ei] = rangeKm;
+    changed = accumulateSample(acc, icao, {
+      lat: item.lat,
+      lon: item.lon,
+      altFt,
+      timeMs,
+    }) || changed;
   }
   return changed;
+}
+
+function accumulateSample(acc, icao, sample) {
+  const enuPt = acc.enu(sample.lon, sample.lat);
+  const east = enuPt[0];
+  const north = enuPt[1];
+  const altFt = sample.altFt;
+  const timeMs = numeric(sample.timeMs) ? sample.timeMs : 0;
+
+  const prev = acc.lastSeen.get(icao);
+  let store = false;
+  if (!prev) {
+    store = true;
+  } else {
+    const movedKm = Math.hypot(east - prev.east, north - prev.north);
+    const altDelta = Math.abs(altFt - prev.altFt);
+    const elapsedMs = timeMs - prev.timeMs;
+    if (movedKm >= ACC_MIN_MOVE_KM || altDelta >= ACC_MIN_ALT_FT || elapsedMs >= ACC_MIN_INTERVAL_MS) {
+      store = true;
+    }
+  }
+  if (!store) return false;
+
+  acc.lastSeen.set(icao, { east, north, altFt, timeMs });
+  acc.icaoSeen.add(icao);
+
+  const slot = acc.cloudHead;
+  acc.cloud[slot * 3] = east;
+  acc.cloud[slot * 3 + 1] = north;
+  acc.cloud[slot * 3 + 2] = altFt;
+  acc.cloudHead = (acc.cloudHead + 1) % MAX_POINTS;
+  if (!acc.cloudFull && acc.cloudHead === 0) {
+    acc.cloudFull = true;
+  }
+  acc.cloudCount = acc.cloudFull ? MAX_POINTS : acc.cloudHead;
+
+  const rangeKm = Math.hypot(east, north);
+  if (rangeKm > acc.maxRangeKm) acc.maxRangeKm = rangeKm;
+  if (altFt > acc.maxAltFt) acc.maxAltFt = altFt;
+  let lvl = Math.round(altFt / ENV_ALT_STEP);
+  if (lvl < 0) lvl = 0;
+  if (lvl > ENV_ALT_LEVELS - 1) lvl = ENV_ALT_LEVELS - 1;
+  let bin = Math.floor(bearingFromEnu(east, north) / ENV_BIN_DEG);
+  if (bin < 0) bin = 0;
+  if (bin > ENV_BINS - 1) bin = ENV_BINS - 1;
+  const ei = lvl * ENV_BINS + bin;
+  if (rangeKm > acc.envelope[ei]) acc.envelope[ei] = rangeKm;
+  return true;
 }
 
 // ----------------------------------------------------------------------
@@ -635,7 +738,7 @@ function envelopeRangeAt(profileData, altFt) {
 // CoverageScope — the whole deck.gl visualization as a Preact component.
 // deck.gl is imported from @deck.gl/* and bundled into app.js by `bun build`.
 // ----------------------------------------------------------------------
-export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
+export default function CoverageScope({ items, trails, receiverSite, receiverSites = [], focusReceiverId = null, nowMs }) {
   const containerRef = useRef(null);
   const deckRef = useRef(null);
   const accRef = useRef(null);
@@ -664,55 +767,52 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
   const [sliceCount, setSliceCount] = useState(0); // slice band point count (driven by the redraw)
 
   // Collapsible overlays so the panels don't bury the map.
-  const [collapsed, setCollapsed] = useState({ controls: false, legend: false });
+  const [collapsed, setCollapsed] = useState({ controls: true, legend: false });
   const togglePanel = (k) => setCollapsed((c) => ({ ...c, [k]: !c[k] }));
 
   // dataTick forces deck rebuild + panel redraws when refs alone change.
   const [dataTick, setDataTick] = useState(0);
 
   // ------------------------------------------------------------------
-  // Origin resolution + accumulation pass. Re-anchors on first origin,
-  // when a fixed receiverSite arrives, or when a floating centroid drifts.
+  // Origin resolution + accumulation pass. Re-anchors on receiver focus/site
+  // changes, or when the aircraft-centroid fallback drifts too far.
   // ------------------------------------------------------------------
   useEffect(() => {
-    const fixedSite = receiverSite && numeric(receiverSite.lat) && numeric(receiverSite.lon)
-      ? { lat: receiverSite.lat, lon: receiverSite.lon }
-      : null;
-
-    let origin = fixedSite;
-    let fixed = Boolean(fixedSite);
-    if (!origin) {
-      origin = centroidOf(items);
-      fixed = false;
-    }
-    if (!origin) return; // nothing positioned yet and no fixed site
+    const anchor = resolveCoverageAnchor(receiverSite, receiverSites, focusReceiverId, items);
+    if (!anchor) return; // nothing positioned yet and no receiver site
 
     let acc = accRef.current;
     let reanchored = false;
 
     if (!acc) {
-      acc = makeAccumulator(origin, fixed);
+      acc = makeAccumulator(anchor);
       accRef.current = acc;
       reanchored = true;
-    } else if (fixed && !acc.fixed) {
-      // A real receiver_site arrived: switch to the fixed anchor (clear accumulation).
-      acc = makeAccumulator(origin, true);
+    } else if (anchor.fixed) {
+      const movedKm = haversineKm(acc.origin.lat, acc.origin.lon, anchor.origin.lat, anchor.origin.lon);
+      if (!acc.fixed || acc.anchorKey !== anchor.key || movedKm > 0.05) {
+        acc = makeAccumulator(anchor);
+        accRef.current = acc;
+        reanchored = true;
+      }
+    } else if (acc.fixed) {
+      acc = makeAccumulator(anchor);
       accRef.current = acc;
       reanchored = true;
-    } else if (!fixed && !acc.fixed) {
+    } else {
       // Floating centroid: re-anchor if it drifts beyond the threshold.
-      const drift = haversineKm(acc.origin.lat, acc.origin.lon, origin.lat, origin.lon);
+      const drift = haversineKm(acc.origin.lat, acc.origin.lon, anchor.origin.lat, anchor.origin.lon);
       if (drift > REANCHOR_DRIFT_KM) {
-        acc = makeAccumulator(origin, false);
+        acc = makeAccumulator(anchor);
         accRef.current = acc;
         reanchored = true;
       }
     }
 
     const positioned = items.filter(hasPositionItem);
-    const changed = accumulate(acc, positioned, nowMs);
+    const changed = accumulate(acc, positioned, trails, nowMs);
     if (changed || reanchored) setDataTick((tick) => tick + 1);
-  }, [items, receiverSite, nowMs]);
+  }, [items, trails, receiverSite, receiverSites, focusReceiverId, nowMs]);
 
   // ------------------------------------------------------------------
   // Live planes derived from props.items (positioned only), projected
@@ -728,29 +828,17 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
       const enuPt = acc.enu(item.lon, item.lat);
       const east = enuPt[0];
       const north = enuPt[1];
-      const altFt = numeric(item.altitude_baro_ft)
-        ? item.altitude_baro_ft
-        : numeric(item.altitude_geometric_ft)
-          ? item.altitude_geometric_ft
-          : 0;
+      const altFt = itemAltitudeFt(item);
       const track = numeric(item.track_deg) ? item.track_deg : numeric(item.heading_deg) ? item.heading_deg : 0;
       // Rolled-up display items key on bare ICAO, but trails are stored per
       // observation (receiverId:icao in aggregate mode). Merge across source_keys
       // (mirrors main.jsx mergedTrail), falling back to item.key for collector mode.
-      const trailRaw = trails && trails.get
-        ? (item.source_keys ?? [item.key])
-            .flatMap((k) => trails.get(k) ?? [])
-            .sort((left, right) => Number(left.time ?? 0) - Number(right.time ?? 0))
-        : null;
-      const trail = Array.isArray(trailRaw)
-        ? trailRaw
-            .filter((t) => numeric(t.lat) && numeric(t.lon))
-            .map((t) => {
-              const tp = acc.enu(t.lon, t.lat);
-              // Trail points carry no per-vertex altitude; draw at current altitude.
-              return [tp[0], tp[1], altFt];
-            })
-        : [];
+      const trail = mergedItemTrail(item, trails)
+        .map((t) => {
+          const tp = acc.enu(t.lon, t.lat);
+          // Trail points carry no per-vertex altitude; draw at current altitude.
+          return [tp[0], tp[1], altFt];
+        });
       out.push({
         hex: item.icao,
         flight: item.callsign || null,
@@ -969,8 +1057,8 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
       coordinateSystem: CARTESIAN,
       getSourcePosition: (d) => d.s,
       getTargetPosition: (d) => d.t,
-      getColor: [255, 255, 255, 130],
-      getWidth: 2,
+      getColor: [121, 211, 239, 64],
+      getWidth: 1.2,
       widthUnits: "pixels",
       widthMinPixels: 1,
       updateTriggers: { getTargetPosition: exag },
@@ -983,9 +1071,9 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
       getPosition: (d) => d.p,
       getRadius: 6,
       radiusUnits: "pixels",
-      getFillColor: [255, 255, 255, 255],
+      getFillColor: [220, 245, 255, 230],
       stroked: true,
-      getLineColor: [0, 200, 255, 255],
+      getLineColor: [121, 211, 239, 190],
       lineWidthUnits: "pixels",
       getLineWidth: 2,
       parameters: { depthTest: true },
@@ -1275,7 +1363,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
   const maxRangeKm = acc ? acc.maxRangeKm : 0;
   const maxAltFt = acc ? acc.maxAltFt : 0;
   const positionedCount = useMemo(() => items.filter(hasPositionItem).length, [items]);
-  const anchorLabel = acc ? (acc.fixed ? "Station origin" : "Centroid anchor") : "Awaiting positions";
+  const anchorLabel = acc ? acc.anchorLabel : "Awaiting positions";
 
   const fmtN = (n) => (typeof n === "number" && isFinite(n) ? n.toLocaleString("en-US") : "—");
 
@@ -1301,7 +1389,7 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
               session data
             </span>
           </div>
-          <p className="scope-summary">{positionedCount} positioned / {liveCount} live &middot; ephemeral, not yet wired to the submission store</p>
+          <p className="scope-summary">{positionedCount} positioned / {liveCount} live</p>
         </div>
       </div>
       <div className="cs-deck-wrap">
@@ -1355,29 +1443,35 @@ export default function CoverageScope({ items, trails, receiverSite, nowMs }) {
             <div className="cs-group-label">Layers</div>
             <div className="cs-toggle-grid">
               {LAYER_CHIPS.map(([key, labelText]) => (
-                <div
+                <button
+                  type="button"
                   className={`cs-toggle ${visible[key] ? "on" : ""}`}
                   key={key}
+                  aria-pressed={visible[key]}
                   onClick={() => toggleLayer(key)}
                 >
                   <span className="cs-box" />
                   <span className="cs-lbl">{labelText}</span>
-                </div>
+                </button>
               ))}
-              <div
+              <button
+                type="button"
                 className={`cs-toggle ${profileOpen ? "on" : ""}`}
+                aria-pressed={profileOpen}
                 onClick={() => setProfileOpen((open) => !open)}
               >
                 <span className="cs-box" />
                 <span className="cs-lbl">Profile</span>
-              </div>
-              <div
+              </button>
+              <button
+                type="button"
                 className={`cs-toggle ${sliceOpen ? "on" : ""}`}
+                aria-pressed={sliceOpen}
                 onClick={() => setSliceOpen((open) => !open)}
               >
                 <span className="cs-box" />
                 <span className="cs-lbl">Slice</span>
-              </div>
+              </button>
             </div>
           </div>
 

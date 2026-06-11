@@ -66,6 +66,7 @@ function App() {
   const nowMs = serverClock(clockRef);
   const aggregateMode = isAggregateStatus(status);
   const receiverSite = status.receiver_site ?? null;
+  const receiverSites = useMemo(() => knownReceiverSites(status, receiverSite), [status, receiverSite]);
 
   const handleFeed = useCallback((message) => {
     setServerTime(clockRef, message.now_ms);
@@ -200,9 +201,11 @@ function App() {
         </aside>
         <section className="center-panel" aria-label="Live coverage visualization">
           <CoverageScope
-            items={displayItems}
+            items={scopedItems}
             trails={trailsRef.current}
             receiverSite={receiverSite}
+            receiverSites={receiverSites}
+            focusReceiverId={focusReceiverId}
             nowMs={nowMs}
           />
         </section>
@@ -1132,6 +1135,31 @@ function latestReceiverMessageMs(items, receiverId) {
     .filter((item) => item.receiver?.id === receiverId)
     .reduce((latest, item) => Math.max(latest, Number(item.last_seen_ms ?? 0)), 0)
     || null;
+}
+
+function knownReceiverSites(status, localSite) {
+  const sites = new Map();
+  for (const summary of status.receivers ?? []) {
+    if (summary.receiver?.id && validSite(summary.receiver_site)) {
+      sites.set(summary.receiver.id, {
+        receiver: summary.receiver,
+        site: summary.receiver_site,
+      });
+    }
+  }
+
+  if (status.receiver?.id && validSite(localSite) && !sites.has(status.receiver.id)) {
+    sites.set(status.receiver.id, {
+      receiver: status.receiver,
+      site: localSite,
+    });
+  }
+
+  return [...sites.values()];
+}
+
+function validSite(site) {
+  return Boolean(site) && numeric(site.lat) && numeric(site.lon);
 }
 
 function receiverColor(item) {
