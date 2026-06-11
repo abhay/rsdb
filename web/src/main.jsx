@@ -14,6 +14,11 @@ const FIELD_STALE_MS = 2 * 60 * 1000;
 const RECEIVER_COLORS = ["#70d673", "#7fdcff", "#f7cb6f", "#e88a74", "#a78bfa", "#4cc8a3", "#f78fb3"];
 const MAP_STYLE_URL = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
 const MAP_READY_TIMEOUT_MS = 6000;
+const MAP_RECENTER_MIN_INTERVAL_MS = 12 * 1000;
+const MAP_RECENTER_MIN_DEADBAND_KM = 1.5;
+const MAP_RECENTER_MAX_DEADBAND_KM = 12;
+const MAP_RECENTER_DEADBAND_RANGE_FRACTION = 0.12;
+const MAP_AUTO_RANGE_SHRINK_INTERVAL_MS = 45 * 1000;
 const DEFAULT_CENTER = { lat: 0, lon: 0 };
 
 const EMPTY_STATUS = {
@@ -491,8 +496,12 @@ function SpatialPanel({
   const [resizeVersion, setResizeVersion] = useState(0);
   const positioned = useMemo(() => rows.filter(hasPosition), [rows]);
   const focusSite = focusedReceiverSite(receiverSites, focusReceiverId) ?? receiverSite;
-  const centerSite = spatialCenter(rows, receiverSites, focusSite);
-  const effectiveRange = effectiveRangeKm(rows, positioned, rangeKm, centerSite, trails, receiverSites);
+  const targetCenter = spatialCenter(rows, receiverSites, focusSite);
+  const targetRange = effectiveRangeKm(rows, positioned, rangeKm, targetCenter, trails, receiverSites);
+  const centerSourceKey = spatialCenterSourceKey(receiverSites, focusReceiverId);
+  const viewport = useStableSpatialViewport(targetCenter, targetRange, centerSourceKey, rangeKm);
+  const centerSite = viewport.center;
+  const effectiveRange = viewport.range;
   const readoutItem = hoveredItem ?? selectedItem;
 
   useEffect(() => {
@@ -530,7 +539,7 @@ function SpatialPanel({
       }, MAP_READY_TIMEOUT_MS);
       map.on("load", markReady);
       map.on("styledata", markReady);
-      map.on("move", () => setResizeVersion((version) => version + 1));
+      map.on("moveend", () => setResizeVersion((version) => version + 1));
 
       resizeObserver = new ResizeObserver(() => {
         map.resize();
@@ -552,8 +561,8 @@ function SpatialPanel({
 
   useEffect(() => {
     if (mapStatus !== "ok" || !mapRef.current) return;
-    fitSpatialMap(mapRef.current, rows, trails, receiverSites, focusSite, rangeKm);
-  }, [mapStatus, rangeKm, receiverSites, focusSite, rows.length, trails]);
+    fitSpatialMap(mapRef.current, centerSite, effectiveRange);
+  }, [mapStatus, centerSite.lat, centerSite.lon, effectiveRange]);
 
   useEffect(() => {
     const onResize = () => setResizeVersion((version) => version + 1);
@@ -566,17 +575,17 @@ function SpatialPanel({
       canvas: canvasRef.current,
       rows,
       trails,
-      receiverSite,
       receiverSites,
       focusSite,
+      centerSite,
+      effectiveRange,
       map: mapStatus === "ok" ? mapRef.current : null,
-      rangeKm,
       selectedKey,
       hoverKey,
       overlays,
       receiverHandleCollisions,
     });
-  }, [rows, trails, receiverSite, receiverSites, focusSite, mapStatus, rangeKm, selectedKey, hoverKey, overlays, receiverHandleCollisions, resizeVersion]);
+  }, [rows, trails, receiverSites, focusSite, centerSite.lat, centerSite.lon, effectiveRange, mapStatus, selectedKey, hoverKey, overlays, receiverHandleCollisions, resizeVersion]);
 
   function handlePointerMove(event) {
     const target = targetFromEvent(event, canvasRef.current, targetsRef.current);
@@ -1602,15 +1611,95 @@ function visibleRows(items, { filter, search, sortKey, sortDir, receiverHandleCo
     .sort((left, right) => compareRows(left, right, sortKey, sortDir, receiverHandleCollisions));
 }
 
+function useStableSpatialViewport(targetCenter, targetRange, centerSourceKey, rangeSetting) {
+  const [viewport, setViewport] = useState(() => ({
+    center: targetCenter,
+    range: targetRange,
+    centerSourceKey,
+    rangeSetting,
+    centerUpdatedAt: performance.now(),
+    rangeUpdatedAt: performance.now(),
+  }));
+
+  useEffect(() => {
+    setViewport((current) => {
+      const now = performance.now();
+      const centerSourceChanged = current.centerSourceKey !== centerSourceKey;
+      const rangeSettingChanged = current.rangeSetting !== rangeSetting;
+      const hasCenter = validSite(current.center);
+      const movedKm = hasCenter
+        ? haversineDistanceKm(current.center.lat, current.center.lon, targetCenter.lat, targetCenter.lon)
+        : Infinity;
+      const centerElapsedMs = now - current.centerUpdatedAt;
+      const shouldRecenter = centerSourceChanged
+        || !hasCenter
+        || (
+          movedKm >= spatialCenterDeadbandKm(targetRange)
+          && centerElapsedMs >= MAP_RECENTER_MIN_INTERVAL_MS
+        );
+      const rangeElapsedMs = now - current.rangeUpdatedAt;
+      const nextRange = stableSpatialRange(
+        current.range,
+        targetRange,
+        rangeSetting,
+        centerSourceChanged || rangeSettingChanged,
+        rangeElapsedMs,
+      );
+      const rangeChanged = nextRange !== current.range;
+
+      if (!shouldRecenter && !rangeChanged && !rangeSettingChanged) return current;
+
+      return {
+        center: shouldRecenter ? targetCenter : current.center,
+        range: nextRange,
+        centerSourceKey,
+        rangeSetting,
+        centerUpdatedAt: shouldRecenter ? now : current.centerUpdatedAt,
+        rangeUpdatedAt: rangeChanged ? now : current.rangeUpdatedAt,
+      };
+    });
+  }, [targetCenter.lat, targetCenter.lon, targetRange, centerSourceKey, rangeSetting]);
+
+  return viewport;
+}
+
+function spatialCenterSourceKey(receiverSites, focusReceiverId) {
+  if (focusReceiverId) {
+    const focusSite = receiverSites.find((entry) => entry.receiver?.id === focusReceiverId)?.site;
+    return validSite(focusSite)
+      ? `focus:${focusReceiverId}:${focusSite.lat},${focusSite.lon}`
+      : `focus:${focusReceiverId}:missing`;
+  }
+  const receiverIds = receiverSites
+    .filter((entry) => validSite(entry.site))
+    .map((entry) => `${entry.receiver?.id ?? "unknown"}:${entry.site.lat},${entry.site.lon}`)
+    .sort();
+  return receiverIds.length > 0 ? `receivers:${receiverIds.join("|")}` : "aircraft";
+}
+
+function spatialCenterDeadbandKm(rangeKm) {
+  return Math.min(
+    MAP_RECENTER_MAX_DEADBAND_KM,
+    Math.max(MAP_RECENTER_MIN_DEADBAND_KM, Number(rangeKm) * MAP_RECENTER_DEADBAND_RANGE_FRACTION),
+  );
+}
+
+function stableSpatialRange(currentRange, targetRange, rangeSetting, force, elapsedMs) {
+  if (rangeSetting !== "auto" || force || !numeric(currentRange)) return targetRange;
+  if (targetRange > currentRange) return targetRange;
+  if (targetRange < currentRange && elapsedMs >= MAP_AUTO_RANGE_SHRINK_INTERVAL_MS) return targetRange;
+  return currentRange;
+}
+
 function drawSpatialOverlay({
   canvas,
   rows,
   trails,
-  receiverSite,
   receiverSites,
   focusSite,
+  centerSite,
+  effectiveRange,
   map,
-  rangeKm,
   selectedKey,
   hoverKey,
   overlays,
@@ -1638,8 +1727,6 @@ function drawSpatialOverlay({
   context.clearRect(0, 0, width, height);
 
   const positioned = rows.filter(hasPosition);
-  const centerSite = spatialCenter(rows, receiverSites, focusSite ?? receiverSite);
-  const effectiveRange = effectiveRangeKm(rows, positioned, rangeKm, centerSite, trails, receiverSites);
   const projector = makeSpatialProjector(width, height, effectiveRange, positioned, centerSite, map);
   const targets = [];
 
@@ -1732,10 +1819,7 @@ function drawRadarOverlay(context, projector, width, height, rangeKm, receiverSi
   context.restore();
 }
 
-function fitSpatialMap(map, rows, trails, receiverSites, focusSite, rangeKm) {
-  const positioned = rows.filter(hasPosition);
-  const center = spatialCenter(rows, receiverSites, focusSite);
-  const effectiveRange = effectiveRangeKm(rows, positioned, rangeKm, center, trails, receiverSites);
+function fitSpatialMap(map, center, effectiveRange) {
   const latDelta = effectiveRange / 111.32;
   const lonDelta = effectiveRange / Math.max(1, 111.32 * Math.cos(degreesToRadians(center.lat)));
 
@@ -1744,7 +1828,7 @@ function fitSpatialMap(map, rows, trails, receiverSites, focusSite, rangeKm) {
       [center.lon - lonDelta, center.lat - latDelta],
       [center.lon + lonDelta, center.lat + latDelta],
     ],
-    { padding: 58, duration: 250, maxZoom: 12 },
+    { padding: 58, duration: 0, maxZoom: 12 },
   );
 }
 
@@ -1753,13 +1837,13 @@ function spatialCenter(rows, receiverSites, focusSite = null) {
     return { lat: focusSite.lat, lon: focusSite.lon };
   }
 
-  const positioned = rows.filter(hasPosition);
-  if (positioned.length > 0) return averagePosition(positioned, null);
-
   const sites = receiverSites
     .map((entry) => entry.site)
     .filter(validSite);
   if (sites.length > 0) return averagePosition(sites, null);
+
+  const positioned = rows.filter(hasPosition);
+  if (positioned.length > 0) return averagePosition(positioned, null);
 
   return DEFAULT_CENTER;
 }
