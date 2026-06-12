@@ -6,6 +6,7 @@ WORKDIR /app
 COPY package.json bun.lock tsconfig.json ./
 COPY README.md AGENTS.md ./
 COPY docs ./docs
+COPY pi/README.md ./pi/README.md
 COPY web ./web
 COPY scripts ./scripts
 RUN bun install --frozen-lockfile
