@@ -49,8 +49,9 @@ Common local commands:
 ## Raspberry Pi Receiver
 
 The hardware path keeps the USB SDR off your laptop and puts it on a Raspberry
-Pi receiver node. See [pi/README.md](pi/README.md) for the CLI-only flash,
-first-boot, and provisioning flow.
+Pi receiver node. Pi onboarding installs prebuilt ARM64 release artifacts
+instead of compiling Rust on-device. See [pi/README.md](pi/README.md) for the
+CLI-only flash, first-boot, and provisioning flow.
 
 To join the shared aggregate, see
 [Multi-Receiver Onboarding](docs/DEPLOYMENT.md#multi-receiver-onboarding).

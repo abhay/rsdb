@@ -80,8 +80,9 @@ Common local commands:
 ## Raspberry Pi Receiver
 
 The hardware path keeps the USB SDR off your laptop and puts it on a Raspberry
-Pi receiver node. See [pi/README.md](pi/README.md) for the CLI-only flash,
-first-boot, and provisioning flow.
+Pi receiver node. Pi onboarding installs prebuilt ARM64 release artifacts
+instead of compiling Rust on-device. See [pi/README.md](pi/README.md) for the
+CLI-only flash, first-boot, and provisioning flow.
 
 To join the shared aggregate, see
 [Multi-Receiver Onboarding](docs/DEPLOYMENT.md#multi-receiver-onboarding).
@@ -513,6 +514,26 @@ RSDB uses shell-style environment files.
 
 Copy [.env.example](../.env.example) to `.env` for local receiver work.
 
+## Release Install
+
+Release-installed Pi nodes run binaries through `/opt/rsdb/current/bin/...`.
+The installer writes these settings to `/etc/rsdb/rsdb.env`:
+
+```sh
+RSDB_NODE_PROFILE=receiver
+RSDB_RELEASE_CHANNEL=stable
+RSDB_VERSION=latest
+```
+
+`RSDB_NODE_PROFILE=receiver` enables only `rsdb.service` and submits to a
+remote aggregate. `RSDB_NODE_PROFILE=full` enables both `rsdb.service` and
+`rsdb-aggregate.service`, and ensures the local aggregate URL is in
+`RSDB_SUBMIT_URLS`.
+
+`RSDB_RELEASE_CHANNEL=stable` with `RSDB_VERSION=latest` installs the latest
+tagged release. Set `RSDB_RELEASE_CHANNEL=nightly` for the prerelease channel,
+or set `RSDB_VERSION=vX.Y.Z` for an exact tag.
+
 ## Required Local Receiver Fields
 
 ```sh
@@ -596,6 +617,11 @@ aggregates to `RSDB_SUBMIT_URLS` as a comma or whitespace separated list:
 RSDB_SUBMIT_URLS='http://127.0.0.1:8090,https://rsdb.hackshare.com'
 ```
 
+`RSDB_REMOTE_AGGREGATE_URLS` is an installer helper used when deriving profile
+defaults. The `receiver` profile uses it as the submit target when
+`RSDB_SUBMIT_URLS` is not already configured. The `full` profile appends it to
+the local aggregate URL when present.
+
 The outbox is durable, but the live feed has a freshness limit. If an aggregate
 is unavailable or the sender falls behind, payloads older than
 `RSDB_SUBMIT_MAX_LAG_SECONDS` are dropped instead of being replayed as live
@@ -645,16 +671,39 @@ Source: `docs/DEPLOYMENT.md`
 
 Use [pi/README.md](../pi/README.md) for the CLI-only Pi setup.
 
-The provisioned Pi runs:
+Release-installed Pi nodes use prebuilt ARM64 GitHub Release artifacts and do
+not compile Rust on-device. Choose a profile:
 
 ```text
-rsdb.service             rsdb-usb serve
-rsdb-aggregate.service   rsdb-aggregate serve
+receiver   rsdb.service only; submits to a remote aggregate
+full       rsdb.service plus rsdb-aggregate.service for local UI/API
 ```
 
-The receiver service is hardware-adjacent and normally binds diagnostics to
+Install commands:
+
+```sh
+./pi/install-release.sh receiver
+./pi/install-release.sh full
+RSDB_RELEASE_CHANNEL=nightly ./pi/install-release.sh receiver
+RSDB_VERSION=v0.1.0 ./pi/install-release.sh full
+./pi/install-release.sh receiver --enable-updater
+```
+
+From a laptop that has already followed the receiver onboarding flow, provision
+a Pi from the nightly channel with:
+
+```sh
+RSDB_NODE_PROFILE=receiver RSDB_RELEASE_CHANNEL=nightly ./pi/push-and-provision.sh
+```
+
+The receiver service is hardware-adjacent and normally binds diagnostics on
 `127.0.0.1:8080`. The aggregate service verifies signed submissions and serves
-the UI/API on `0.0.0.0:8090`.
+the UI/API on `0.0.0.0:8090` when the `full` profile is installed.
+
+Release installs put binaries under `/opt/rsdb/releases/<version>` and update
+`/opt/rsdb/current` atomically. Systemd units execute
+`/opt/rsdb/current/bin/rsdb-usb` and
+`/opt/rsdb/current/bin/rsdb-aggregate`.
 
 Useful checks on the Pi:
 
@@ -686,6 +735,9 @@ Deploy:
 ```sh
 fly deploy
 ```
+
+Fly deploys are still manual. The GitHub release workflow only publishes
+Raspberry Pi release artifacts and the `nightly` prerelease channel.
 
 The Fly service listens on internal port `8080`, serves HTTPS publicly, and
 stores hot aggregate state under `/data/aggregate`. The Docker image copies

@@ -11,6 +11,26 @@ RSDB uses shell-style environment files.
 
 Copy [.env.example](../.env.example) to `.env` for local receiver work.
 
+## Release Install
+
+Release-installed Pi nodes run binaries through `/opt/rsdb/current/bin/...`.
+The installer writes these settings to `/etc/rsdb/rsdb.env`:
+
+```sh
+RSDB_NODE_PROFILE=receiver
+RSDB_RELEASE_CHANNEL=stable
+RSDB_VERSION=latest
+```
+
+`RSDB_NODE_PROFILE=receiver` enables only `rsdb.service` and submits to a
+remote aggregate. `RSDB_NODE_PROFILE=full` enables both `rsdb.service` and
+`rsdb-aggregate.service`, and ensures the local aggregate URL is in
+`RSDB_SUBMIT_URLS`.
+
+`RSDB_RELEASE_CHANNEL=stable` with `RSDB_VERSION=latest` installs the latest
+tagged release. Set `RSDB_RELEASE_CHANNEL=nightly` for the prerelease channel,
+or set `RSDB_VERSION=vX.Y.Z` for an exact tag.
+
 ## Required Local Receiver Fields
 
 ```sh
@@ -93,6 +113,11 @@ aggregates to `RSDB_SUBMIT_URLS` as a comma or whitespace separated list:
 ```sh
 RSDB_SUBMIT_URLS='http://127.0.0.1:8090,https://rsdb.hackshare.com'
 ```
+
+`RSDB_REMOTE_AGGREGATE_URLS` is an installer helper used when deriving profile
+defaults. The `receiver` profile uses it as the submit target when
+`RSDB_SUBMIT_URLS` is not already configured. The `full` profile appends it to
+the local aggregate URL when present.
 
 The outbox is durable, but the live feed has a freshness limit. If an aggregate
 is unavailable or the sender falls behind, payloads older than

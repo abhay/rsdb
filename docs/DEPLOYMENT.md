@@ -4,16 +4,39 @@
 
 Use [pi/README.md](../pi/README.md) for the CLI-only Pi setup.
 
-The provisioned Pi runs:
+Release-installed Pi nodes use prebuilt ARM64 GitHub Release artifacts and do
+not compile Rust on-device. Choose a profile:
 
 ```text
-rsdb.service             rsdb-usb serve
-rsdb-aggregate.service   rsdb-aggregate serve
+receiver   rsdb.service only; submits to a remote aggregate
+full       rsdb.service plus rsdb-aggregate.service for local UI/API
 ```
 
-The receiver service is hardware-adjacent and normally binds diagnostics to
+Install commands:
+
+```sh
+./pi/install-release.sh receiver
+./pi/install-release.sh full
+RSDB_RELEASE_CHANNEL=nightly ./pi/install-release.sh receiver
+RSDB_VERSION=v0.1.0 ./pi/install-release.sh full
+./pi/install-release.sh receiver --enable-updater
+```
+
+From a laptop that has already followed the receiver onboarding flow, provision
+a Pi from the nightly channel with:
+
+```sh
+RSDB_NODE_PROFILE=receiver RSDB_RELEASE_CHANNEL=nightly ./pi/push-and-provision.sh
+```
+
+The receiver service is hardware-adjacent and normally binds diagnostics on
 `127.0.0.1:8080`. The aggregate service verifies signed submissions and serves
-the UI/API on `0.0.0.0:8090`.
+the UI/API on `0.0.0.0:8090` when the `full` profile is installed.
+
+Release installs put binaries under `/opt/rsdb/releases/<version>` and update
+`/opt/rsdb/current` atomically. Systemd units execute
+`/opt/rsdb/current/bin/rsdb-usb` and
+`/opt/rsdb/current/bin/rsdb-aggregate`.
 
 Useful checks on the Pi:
 
@@ -45,6 +68,9 @@ Deploy:
 ```sh
 fly deploy
 ```
+
+Fly deploys are still manual. The GitHub release workflow only publishes
+Raspberry Pi release artifacts and the `nightly` prerelease channel.
 
 The Fly service listens on internal port `8080`, serves HTTPS publicly, and
 stores hot aggregate state under `/data/aggregate`. The Docker image copies

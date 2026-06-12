@@ -80,11 +80,35 @@ fi
 quoted_lat="$(shell_quote "$RSDB_RECEIVER_LAT")"
 quoted_lon="$(shell_quote "$RSDB_RECEIVER_LON")"
 remote_env="RSDB_RECEIVER_LAT=$quoted_lat RSDB_RECEIVER_LON=$quoted_lon"
+if [ -n "${RSDB_NODE_HOSTNAME:-}" ]; then
+    remote_env="$remote_env RSDB_NODE_HOSTNAME=$(shell_quote "$RSDB_NODE_HOSTNAME")"
+fi
 if [ -n "${RSDB_SUBMIT_URLS:-}" ]; then
     remote_env="$remote_env RSDB_SUBMIT_URLS=$(shell_quote "$RSDB_SUBMIT_URLS")"
 fi
 if [ -n "${RSDB_SUBMIT_MAX_LAG_SECONDS:-}" ]; then
     remote_env="$remote_env RSDB_SUBMIT_MAX_LAG_SECONDS=$(shell_quote "$RSDB_SUBMIT_MAX_LAG_SECONDS")"
 fi
+if [ -n "${RSDB_RELEASE_CHANNEL:-}" ]; then
+    remote_env="$remote_env RSDB_RELEASE_CHANNEL=$(shell_quote "$RSDB_RELEASE_CHANNEL")"
+fi
+if [ -n "${RSDB_VERSION:-}" ]; then
+    remote_env="$remote_env RSDB_VERSION=$(shell_quote "$RSDB_VERSION")"
+fi
+if [ -n "${RSDB_REMOTE_AGGREGATE_URLS:-}" ]; then
+    remote_env="$remote_env RSDB_REMOTE_AGGREGATE_URLS=$(shell_quote "$RSDB_REMOTE_AGGREGATE_URLS")"
+fi
+if [ -n "${RSDB_GITHUB_REPOSITORY:-}" ]; then
+    remote_env="$remote_env RSDB_GITHUB_REPOSITORY=$(shell_quote "$RSDB_GITHUB_REPOSITORY")"
+fi
 
-$ssh_cmd "$target" "cd ~/rsdb && $remote_env ./pi/provision-pi.sh"
+node_profile="${RSDB_NODE_PROFILE:-full}"
+case "$node_profile" in
+    receiver | full) ;;
+    *)
+        echo "RSDB_NODE_PROFILE must be receiver or full" >&2
+        exit 1
+        ;;
+esac
+
+$ssh_cmd "$target" "cd ~/rsdb && $remote_env ./pi/install-release.sh $(shell_quote "$node_profile")"
