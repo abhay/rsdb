@@ -18,6 +18,7 @@ const DEFAULT_STALE_AFTER_SECONDS: u64 = 60;
 pub(crate) const DEFAULT_HEARTBEAT_SECONDS: u64 = 15;
 const DEFAULT_RETRY_SECONDS: u64 = 10;
 const DEFAULT_SUBMIT_RETRY_SECONDS: u64 = 5;
+const DEFAULT_SUBMIT_MAX_LAG_SECONDS: u64 = 60;
 const DEFAULT_SUBMIT_OUTBOX_MAX_MB: u64 = 25;
 const DEFAULT_PERSIST_FEED_MAX_MB: u64 = 100;
 pub(crate) const BYTES_PER_MEGABYTE: u64 = 1_000_000;
@@ -43,6 +44,7 @@ pub(crate) struct RuntimeConfig {
     signing_key_path: Option<PathBuf>,
     submit_urls: Vec<String>,
     submit_retry_ms: u64,
+    submit_max_lag_ms: u64,
     submission_outbox_dir: Option<PathBuf>,
     submission_outbox_max_bytes: u64,
 }
@@ -69,6 +71,7 @@ impl Default for RuntimeConfig {
             signing_key_path: None,
             submit_urls: Vec::new(),
             submit_retry_ms: seconds_to_ms(DEFAULT_SUBMIT_RETRY_SECONDS),
+            submit_max_lag_ms: seconds_to_ms(DEFAULT_SUBMIT_MAX_LAG_SECONDS),
             submission_outbox_dir: None,
             submission_outbox_max_bytes: DEFAULT_SUBMIT_OUTBOX_MAX_MB * BYTES_PER_MEGABYTE,
         }
@@ -196,6 +199,7 @@ impl RuntimeConfig {
             signer: self.submission_signer()?,
             receiver_identity: self.required_receiver_identity()?,
             retry_after: Duration::from_millis(self.submit_retry_ms.max(1_000)),
+            max_payload_lag: Duration::from_millis(self.submit_max_lag_ms.max(1_000)),
             outbox: self
                 .submission_outbox_dir
                 .clone()
@@ -284,6 +288,13 @@ impl RuntimeConfig {
             "RSDB_SUBMIT_RETRY_SECONDS" => {
                 self.submit_retry_ms = seconds_to_ms(parse_u64(value, key)?);
             }
+            "RSDB_SUBMIT_MAX_LAG_SECONDS" => {
+                let max_lag_seconds = parse_u64(value, key)?;
+                if max_lag_seconds == 0 {
+                    return Err(format!("{key} must be greater than zero"));
+                }
+                self.submit_max_lag_ms = seconds_to_ms(max_lag_seconds);
+            }
             "RSDB_SUBMIT_OUTBOX_DIR" => self.submission_outbox_dir = parse_optional_path(value),
             "RSDB_SUBMIT_OUTBOX_MAX_MB" => {
                 let max_mb = parse_u64(value, key)?;
@@ -326,6 +337,7 @@ pub(crate) struct SubmissionConfig {
     pub(crate) signer: SubmissionSigner,
     pub(crate) receiver_identity: ReceiverIdentity,
     pub(crate) retry_after: Duration,
+    pub(crate) max_payload_lag: Duration,
     pub(crate) outbox: Option<SubmissionOutboxConfig>,
 }
 
@@ -350,6 +362,7 @@ const CONFIG_KEYS: &[&str] = &[
     "RSDB_SIGNING_KEY_PATH",
     "RSDB_SUBMIT_URLS",
     "RSDB_SUBMIT_RETRY_SECONDS",
+    "RSDB_SUBMIT_MAX_LAG_SECONDS",
     "RSDB_SUBMIT_OUTBOX_DIR",
     "RSDB_SUBMIT_OUTBOX_MAX_MB",
 ];
@@ -704,6 +717,9 @@ mod tests {
             .unwrap();
         config.apply_pair("RSDB_SUBMIT_RETRY_SECONDS", "7").unwrap();
         config
+            .apply_pair("RSDB_SUBMIT_MAX_LAG_SECONDS", "11")
+            .unwrap();
+        config
             .apply_pair("RSDB_SUBMIT_OUTBOX_DIR", "/tmp/rsdb-submit-outbox")
             .unwrap();
         config.apply_pair("RSDB_SUBMIT_OUTBOX_MAX_MB", "3").unwrap();
@@ -725,6 +741,7 @@ mod tests {
         );
         assert_eq!(submission.receiver_identity.name, None);
         assert_eq!(submission.retry_after, Duration::from_secs(7));
+        assert_eq!(submission.max_payload_lag, Duration::from_secs(11));
         assert_eq!(
             submission
                 .outbox
@@ -768,6 +785,18 @@ mod tests {
         assert!(
             config
                 .apply_pair("RSDB_SUBMIT_OUTBOX_MAX_MB", "0")
+                .unwrap_err()
+                .contains("must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn runtime_config_rejects_zero_submission_max_lag() {
+        let mut config = RuntimeConfig::default();
+
+        assert!(
+            config
+                .apply_pair("RSDB_SUBMIT_MAX_LAG_SECONDS", "0")
                 .unwrap_err()
                 .contains("must be greater than zero")
         );

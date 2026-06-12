@@ -30,10 +30,11 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN RSDB_SKIP_WEB_BUNDLE_CHECK=1 cargo chef cook --release --recipe-path recipe.json -p rsdb-aggregate --bin rsdb-aggregate
 
-COPY Cargo.toml Cargo.lock package.json bun.lock tsconfig.json ./
+COPY Cargo.toml Cargo.lock ./
+COPY --from=web /app/package.json /app/bun.lock /app/tsconfig.json ./
 COPY crates ./crates
-COPY web/src ./web/src
-COPY web/static ./web/static
+COPY --from=web /app/web/src ./web/src
+COPY --from=web /app/web/static ./web/static
 COPY --from=web /app/web/dist ./web/dist
 RUN cargo build --release -p rsdb-aggregate --bin rsdb-aggregate
 

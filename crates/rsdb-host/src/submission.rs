@@ -22,6 +22,12 @@ pub struct SubmissionStatus {
     pub outbox_pending: u64,
     pub outbox_delivered: u64,
     pub outbox_dropped: u64,
+    #[serde(default)]
+    pub stale_dropped: u64,
+    #[serde(default)]
+    pub last_payload_lag_ms: Option<u64>,
+    #[serde(default)]
+    pub max_payload_lag_ms: Option<u64>,
     pub last_queued_ms: Option<u64>,
     pub last_delivered_ms: Option<u64>,
     pub last_error: Option<String>,
@@ -87,6 +93,8 @@ impl SubmissionStatus {
             enabled: self.enabled,
             delivered: self.delivered,
             outbox_pending: u32::try_from(self.outbox_pending).unwrap_or(u32::MAX),
+            stale_dropped: self.stale_dropped,
+            last_payload_lag_ms: self.last_payload_lag_ms,
             has_error: self.last_error.is_some(),
             target_count: u32::try_from(self.targets.len()).unwrap_or(u32::MAX),
             targets_with_error: u32::try_from(
@@ -127,6 +135,10 @@ pub struct SubmissionHealth {
     pub enabled: bool,
     pub delivered: u64,
     pub outbox_pending: u32,
+    #[serde(default)]
+    pub stale_dropped: u64,
+    #[serde(default)]
+    pub last_payload_lag_ms: Option<u64>,
     pub has_error: bool,
     #[serde(default)]
     pub target_count: u32,

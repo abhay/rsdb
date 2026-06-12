@@ -35,6 +35,12 @@ use usb::{GainMode, IqStream, RtlSdrConfig, RtlSdrSource, list_rtl_sdr_devices};
 #[cfg(feature = "websocket")]
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "websocket")]
+const SUBMISSION_COALESCE_WAIT: Duration = Duration::from_millis(250);
+#[cfg(feature = "websocket")]
+const MAX_SUBMISSION_DRAIN: usize = 256;
+#[cfg(feature = "websocket")]
+const MAX_FRAME_RECORDS_PER_SUBMISSION: usize = 64;
+#[cfg(feature = "websocket")]
 static TLS_CLIENT_CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, String>> = OnceLock::new();
 #[cfg(feature = "websocket")]
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -865,7 +871,7 @@ fn start_submission_worker(config: SubmissionConfig) -> Result<SubmissionWorker,
         .name("rsdb-submit".to_owned())
         .spawn(move || {
             run_submission_worker(
-                receiver,
+                &receiver,
                 &config,
                 &aggregate_urls,
                 outbox.as_ref(),
@@ -879,7 +885,7 @@ fn start_submission_worker(config: SubmissionConfig) -> Result<SubmissionWorker,
 
 #[cfg(feature = "websocket")]
 fn run_submission_worker(
-    receiver: std::sync::mpsc::Receiver<SubmissionPayload>,
+    receiver: &std::sync::mpsc::Receiver<SubmissionPayload>,
     config: &SubmissionConfig,
     aggregate_urls: &[String],
     outbox: Option<&SubmissionOutbox>,
@@ -899,7 +905,9 @@ fn run_submission_worker(
             "Using durable submission outbox {}",
             outbox.path().display()
         );
-        if let Err(error) = flush_submission_outbox(outbox, aggregate_urls, &mut stats) {
+        if let Err(error) =
+            flush_submission_outbox(outbox, aggregate_urls, &mut stats, config.max_payload_lag)
+        {
             next_outbox_flush = Instant::now() + config.retry_after;
             stats.last_error = Some(error.clone());
             eprintln!(
@@ -911,77 +919,21 @@ fn run_submission_worker(
         publish_submission_status(shared_status, &stats);
     }
 
-    for payload in receiver {
-        stats.received = stats.received.saturating_add(1);
-        let payload = match payload_for_signing(payload, &config.receiver_identity) {
-            Ok(payload) => payload,
-            Err(error) => {
-                stats.last_error = Some(error.clone());
-                eprintln!("receiver submission skipped: {error}");
-                publish_submission_status(shared_status, &stats);
-                continue;
-            }
-        };
-        let submission = match config.signer.sign_payload(payload, unix_time_ms()) {
-            Ok(submission) => submission,
-            Err(error) => {
-                let error = format!("failed to sign submission payload: {error}");
-                stats.last_error = Some(error.clone());
-                eprintln!("{error}");
-                publish_submission_status(shared_status, &stats);
-                continue;
-            }
-        };
-        stats.signed = stats.signed.saturating_add(1);
+    let mut runtime = SubmissionWorkerRuntime {
+        config,
+        aggregate_urls,
+        outbox,
+        shared_status,
+        next_outbox_flush,
+    };
 
-        if let Some(outbox) = &outbox {
-            let append = match outbox.append(&submission, aggregate_urls) {
-                Ok(append) => append,
-                Err(error) => {
-                    let error = error.to_string();
-                    stats.last_error = Some(error.clone());
-                    eprintln!(
-                        "{}: submission outbox append failed: {error}",
-                        outbox.path().display()
-                    );
-                    publish_submission_status(shared_status, &stats);
-                    continue;
-                }
-            };
-            stats.outbox_queued = stats.outbox_queued.saturating_add(1);
-            stats.outbox_pending = append.pending;
-            refresh_submission_outbox_pending(outbox, &mut stats);
-            stats.outbox_dropped = stats.outbox_dropped.saturating_add(append.dropped);
-            stats.last_queued_ms = Some(unix_time_ms());
-
-            if Instant::now() >= next_outbox_flush {
-                match flush_submission_outbox(outbox, aggregate_urls, &mut stats) {
-                    Ok(()) => next_outbox_flush = Instant::now(),
-                    Err(error) => {
-                        next_outbox_flush = Instant::now() + config.retry_after;
-                        stats.last_error = Some(error);
-                    }
-                }
+    while let Ok(payload) = receiver.recv() {
+        for payload in collect_submission_payloads(payload, receiver) {
+            runtime.process_payload(payload, &mut stats);
+            if last_report.elapsed() >= Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS) {
+                print_submission_status(&stats);
+                last_report = Instant::now();
             }
-        } else {
-            for url in aggregate_urls {
-                if let Err(error) = submit_with_retry(
-                    url,
-                    &submission,
-                    config.retry_after,
-                    &mut stats,
-                    shared_status,
-                ) {
-                    stats.last_error = Some(error.clone());
-                    eprintln!("{url}: submission stopped: {error}");
-                }
-            }
-        }
-
-        publish_submission_status(shared_status, &stats);
-        if last_report.elapsed() >= Duration::from_secs(DEFAULT_HEARTBEAT_SECONDS) {
-            print_submission_status(&stats);
-            last_report = Instant::now();
         }
     }
 
@@ -989,12 +941,213 @@ fn run_submission_worker(
 }
 
 #[cfg(feature = "websocket")]
+struct SubmissionWorkerRuntime<'a> {
+    config: &'a SubmissionConfig,
+    aggregate_urls: &'a [String],
+    outbox: Option<&'a SubmissionOutbox>,
+    shared_status: &'a Arc<Mutex<SubmissionStatus>>,
+    next_outbox_flush: Instant,
+}
+
+#[cfg(feature = "websocket")]
+impl SubmissionWorkerRuntime<'_> {
+    fn process_payload(&mut self, payload: SubmissionPayload, stats: &mut SubmissionStatus) {
+        stats.received = stats.received.saturating_add(1);
+        let payload = match payload_for_signing(payload, &self.config.receiver_identity) {
+            Ok(payload) => payload,
+            Err(error) => {
+                stats.last_error = Some(error.clone());
+                eprintln!("receiver submission skipped: {error}");
+                publish_submission_status(self.shared_status, stats);
+                return;
+            }
+        };
+
+        let now_ms = unix_time_ms();
+        if drop_stale_submission_payload(&payload, now_ms, self.config.max_payload_lag, stats) {
+            publish_submission_status(self.shared_status, stats);
+            return;
+        }
+
+        let submission = match self.config.signer.sign_payload(payload, now_ms) {
+            Ok(submission) => submission,
+            Err(error) => {
+                let error = format!("failed to sign submission payload: {error}");
+                stats.last_error = Some(error.clone());
+                eprintln!("{error}");
+                publish_submission_status(self.shared_status, stats);
+                return;
+            }
+        };
+        stats.signed = stats.signed.saturating_add(1);
+
+        if let Some(outbox) = self.outbox {
+            self.queue_submission(outbox, &submission, stats);
+        } else {
+            self.submit_without_outbox(&submission, stats);
+        }
+
+        publish_submission_status(self.shared_status, stats);
+    }
+
+    fn queue_submission(
+        &mut self,
+        outbox: &SubmissionOutbox,
+        submission: &SignedSubmission,
+        stats: &mut SubmissionStatus,
+    ) {
+        let append = match outbox.append(submission, self.aggregate_urls) {
+            Ok(append) => append,
+            Err(error) => {
+                let error = error.to_string();
+                stats.last_error = Some(error.clone());
+                eprintln!(
+                    "{}: submission outbox append failed: {error}",
+                    outbox.path().display()
+                );
+                return;
+            }
+        };
+        stats.outbox_queued = stats.outbox_queued.saturating_add(1);
+        stats.outbox_pending = append.pending;
+        refresh_submission_outbox_pending(outbox, stats);
+        stats.outbox_dropped = stats.outbox_dropped.saturating_add(append.dropped);
+        stats.last_queued_ms = Some(unix_time_ms());
+
+        if Instant::now() < self.next_outbox_flush {
+            return;
+        }
+
+        match flush_submission_outbox(
+            outbox,
+            self.aggregate_urls,
+            stats,
+            self.config.max_payload_lag,
+        ) {
+            Ok(()) => self.next_outbox_flush = Instant::now(),
+            Err(error) => {
+                self.next_outbox_flush = Instant::now() + self.config.retry_after;
+                stats.last_error = Some(error);
+            }
+        }
+    }
+
+    fn submit_without_outbox(&self, submission: &SignedSubmission, stats: &mut SubmissionStatus) {
+        for url in self.aggregate_urls {
+            if let Err(error) = submit_with_retry(
+                url,
+                submission,
+                self.config.retry_after,
+                stats,
+                self.shared_status,
+            ) {
+                stats.last_error = Some(error.clone());
+                eprintln!("{url}: submission stopped: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+fn collect_submission_payloads(
+    first: SubmissionPayload,
+    receiver: &std::sync::mpsc::Receiver<SubmissionPayload>,
+) -> Vec<SubmissionPayload> {
+    let mut payloads = vec![first];
+    let deadline = Instant::now() + SUBMISSION_COALESCE_WAIT;
+
+    while payloads.len() < MAX_SUBMISSION_DRAIN {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(payload) => payloads.push(payload),
+            Err(
+                std::sync::mpsc::RecvTimeoutError::Timeout
+                | std::sync::mpsc::RecvTimeoutError::Disconnected,
+            ) => break,
+        }
+    }
+
+    while payloads.len() < MAX_SUBMISSION_DRAIN {
+        match receiver.try_recv() {
+            Ok(payload) => payloads.push(payload),
+            Err(
+                std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected,
+            ) => {
+                break;
+            }
+        }
+    }
+
+    coalesce_submission_payloads(payloads)
+}
+
+#[cfg(feature = "websocket")]
+fn coalesce_submission_payloads(payloads: Vec<SubmissionPayload>) -> Vec<SubmissionPayload> {
+    let mut coalesced = Vec::new();
+    for payload in payloads {
+        match payload {
+            SubmissionPayload::FrameRecords(batch) => {
+                push_frame_record_batch(batch, &mut coalesced);
+            }
+            SubmissionPayload::FeedMessage(message) => {
+                coalesced.push(SubmissionPayload::FeedMessage(message));
+            }
+        }
+    }
+    coalesced
+}
+
+#[cfg(feature = "websocket")]
+fn push_frame_record_batch(mut batch: FrameRecordBatch, coalesced: &mut Vec<SubmissionPayload>) {
+    while !batch.records.is_empty() {
+        if let Some(SubmissionPayload::FrameRecords(current)) = coalesced.last_mut()
+            && can_merge_frame_record_batches(current, &batch)
+        {
+            let remaining = MAX_FRAME_RECORDS_PER_SUBMISSION.saturating_sub(current.records.len());
+            let take = remaining.min(batch.records.len());
+            current.records.extend(batch.records.drain(..take));
+            if batch.records.is_empty() {
+                return;
+            }
+        }
+
+        if batch.records.len() > MAX_FRAME_RECORDS_PER_SUBMISSION {
+            let tail = batch.records.split_off(MAX_FRAME_RECORDS_PER_SUBMISSION);
+            let protocol = batch.protocol;
+            let receiver = batch.receiver.clone();
+            coalesced.push(SubmissionPayload::FrameRecords(batch));
+            batch = FrameRecordBatch::new(protocol, receiver, tail);
+        } else {
+            coalesced.push(SubmissionPayload::FrameRecords(batch));
+            return;
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+fn can_merge_frame_record_batches(left: &FrameRecordBatch, right: &FrameRecordBatch) -> bool {
+    left.protocol == right.protocol
+        && left.receiver.id == right.receiver.id
+        && left.records.len() < MAX_FRAME_RECORDS_PER_SUBMISSION
+}
+
+#[cfg(feature = "websocket")]
 fn flush_submission_outbox(
     outbox: &SubmissionOutbox,
     aggregate_urls: &[String],
     stats: &mut SubmissionStatus,
+    max_payload_lag: Duration,
 ) -> Result<(), String> {
-    flush_submission_outbox_with_submitter(outbox, aggregate_urls, stats, submit_to_aggregate_url)
+    flush_submission_outbox_with_submitter(
+        outbox,
+        aggregate_urls,
+        stats,
+        max_payload_lag,
+        submit_to_aggregate_url,
+    )
 }
 
 #[cfg(feature = "websocket")]
@@ -1002,6 +1155,7 @@ fn flush_submission_outbox_with_submitter(
     outbox: &SubmissionOutbox,
     aggregate_urls: &[String],
     stats: &mut SubmissionStatus,
+    max_payload_lag: Duration,
     mut submitter: impl FnMut(&str, &SignedSubmission, &mut SubmissionStatus) -> Result<(), String>,
 ) -> Result<(), String> {
     let load = outbox.load().map_err(|error| error.to_string())?;
@@ -1014,6 +1168,13 @@ fn flush_submission_outbox_with_submitter(
     stats.update_outbox_pending(&load.entries);
 
     for mut entry in load.entries {
+        let now_ms = unix_time_ms();
+        if drop_stale_submission_payload(&entry.submission.payload, now_ms, max_payload_lag, stats)
+        {
+            changed = true;
+            continue;
+        }
+
         let original_pending_urls = entry.pending_urls.clone();
         let urls = if entry.pending_urls.is_empty() {
             aggregate_urls.to_vec()
@@ -1064,6 +1225,56 @@ fn flush_submission_outbox_with_submitter(
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+#[cfg(feature = "websocket")]
+fn drop_stale_submission_payload(
+    payload: &SubmissionPayload,
+    now_ms: u64,
+    max_payload_lag: Duration,
+    stats: &mut SubmissionStatus,
+) -> bool {
+    let Some(lag_ms) = submission_payload_lag_ms(payload, now_ms) else {
+        return false;
+    };
+    record_submission_payload_lag(stats, lag_ms);
+    if lag_ms <= duration_millis_u64(max_payload_lag) {
+        return false;
+    }
+
+    stats.stale_dropped = stats.stale_dropped.saturating_add(1);
+    true
+}
+
+#[cfg(feature = "websocket")]
+fn submission_payload_lag_ms(payload: &SubmissionPayload, now_ms: u64) -> Option<u64> {
+    submission_payload_observed_at_ms(payload)
+        .map(|observed_at_ms| now_ms.saturating_sub(observed_at_ms))
+}
+
+#[cfg(feature = "websocket")]
+fn submission_payload_observed_at_ms(payload: &SubmissionPayload) -> Option<u64> {
+    match payload {
+        SubmissionPayload::FeedMessage(message) => Some(message.now_ms()),
+        SubmissionPayload::FrameRecords(batch) => {
+            batch.records.iter().map(|record| record.now_ms).max()
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+fn record_submission_payload_lag(stats: &mut SubmissionStatus, lag_ms: u64) {
+    stats.last_payload_lag_ms = Some(lag_ms);
+    stats.max_payload_lag_ms = Some(
+        stats
+            .max_payload_lag_ms
+            .map_or(lag_ms, |max| max.max(lag_ms)),
+    );
+}
+
+#[cfg(feature = "websocket")]
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(feature = "websocket")]
@@ -1137,7 +1348,7 @@ fn publish_submission_status(
 #[cfg(feature = "websocket")]
 fn print_submission_status(status: &SubmissionStatus) {
     eprintln!(
-        "submission stats received={} signed={} delivered={} failed_attempts={} outbox_queued={} outbox_pending={} outbox_delivered={} outbox_dropped={} last_error={}",
+        "submission stats received={} signed={} delivered={} failed_attempts={} outbox_queued={} outbox_pending={} outbox_delivered={} outbox_dropped={} stale_dropped={} last_payload_lag_ms={} max_payload_lag_ms={} last_error={}",
         status.received,
         status.signed,
         status.delivered,
@@ -1146,6 +1357,13 @@ fn print_submission_status(status: &SubmissionStatus) {
         status.outbox_pending,
         status.outbox_delivered,
         status.outbox_dropped,
+        status.stale_dropped,
+        status
+            .last_payload_lag_ms
+            .map_or_else(|| "none".to_owned(), |lag| lag.to_string()),
+        status
+            .max_payload_lag_ms
+            .map_or_else(|| "none".to_owned(), |lag| lag.to_string()),
         status.last_error.as_deref().unwrap_or("none")
     );
 }
@@ -1659,8 +1877,12 @@ mod tests {
         outbox.append(&signed_test_submission(2), &urls).unwrap();
         let mut stats = SubmissionStatus::enabled(urls.clone(), true);
 
-        let error =
-            flush_submission_outbox_with_submitter(&outbox, &urls, &mut stats, |url, _, stats| {
+        let error = flush_submission_outbox_with_submitter(
+            &outbox,
+            &urls,
+            &mut stats,
+            Duration::MAX,
+            |url, _, stats| {
                 if url == healthy_url {
                     stats.record_delivery(url, unix_time_ms());
                     Ok(())
@@ -1669,8 +1891,9 @@ mod tests {
                     stats.record_failure(url, error.clone());
                     Err(error)
                 }
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         let load = outbox.load().unwrap();
 
         assert!(error.contains("simulated failure"));
@@ -1686,6 +1909,76 @@ mod tests {
                 .iter()
                 .all(|entry| entry.pending_urls == [failing_url.clone()])
         );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn coalesces_adjacent_frame_record_submissions() {
+        let payloads = coalesce_submission_payloads(vec![
+            test_frame_record_payload(1_000, 1),
+            test_frame_record_payload(1_010, 2),
+        ]);
+
+        assert_eq!(payloads.len(), 1);
+        match &payloads[0] {
+            SubmissionPayload::FrameRecords(batch) => {
+                assert_eq!(batch.records.len(), 2);
+                assert_eq!(batch.records[0].now_ms, 1_000);
+                assert_eq!(batch.records[1].now_ms, 1_010);
+            }
+            SubmissionPayload::FeedMessage(_) => panic!("expected coalesced frame records"),
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn drops_stale_submission_payloads() {
+        let mut stats = SubmissionStatus::enabled(Vec::new(), false);
+        let payload = test_frame_record_payload(1_000, 1);
+
+        assert!(drop_stale_submission_payload(
+            &payload,
+            62_000,
+            Duration::from_mins(1),
+            &mut stats
+        ));
+        assert_eq!(stats.stale_dropped, 1);
+        assert_eq!(stats.last_payload_lag_ms, Some(61_000));
+        assert_eq!(stats.max_payload_lag_ms, Some(61_000));
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn submission_outbox_drops_stale_entries_before_submit() {
+        let dir = temp_test_dir("rsdb-submit-outbox-stale");
+        let urls = test_submit_urls();
+        let outbox = SubmissionOutbox::open(&SubmissionOutboxConfig {
+            dir: dir.clone(),
+            max_bytes: BYTES_PER_MEGABYTE,
+        })
+        .unwrap();
+        outbox.append(&signed_test_submission(1), &urls).unwrap();
+        let mut stats = SubmissionStatus::enabled(urls.clone(), true);
+        let mut submitted = 0_u64;
+
+        flush_submission_outbox_with_submitter(
+            &outbox,
+            &urls,
+            &mut stats,
+            Duration::from_mins(1),
+            |_, _, _| {
+                submitted = submitted.saturating_add(1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let load = outbox.load().unwrap();
+
+        assert_eq!(submitted, 0);
+        assert_eq!(stats.stale_dropped, 1);
+        assert_eq!(load.entries.len(), 0);
 
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1895,6 +2188,20 @@ mod tests {
         );
         submission.signature = signature_hex(&signing_key, &submission);
         submission
+    }
+
+    #[cfg(feature = "websocket")]
+    fn test_frame_record_payload(now_ms: u64, frame_sequence: u64) -> SubmissionPayload {
+        let frame = Frame::from_hex("8DA062EF9910B19A38040ACE2B14").unwrap();
+        let receiver = ReceiverIdentity::new("sf-rsdb-pi".to_owned());
+        let mut record =
+            FrameRecord::new(now_ms, frame_sequence, &frame).with_receiver(Some(receiver.clone()));
+        record.frame_sequence = Some(frame_sequence);
+        SubmissionPayload::FrameRecords(FrameRecordBatch::new(
+            Protocol::Adsb1090,
+            receiver,
+            vec![record],
+        ))
     }
 
     #[cfg(feature = "websocket")]

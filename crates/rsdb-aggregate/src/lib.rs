@@ -593,49 +593,83 @@ impl AggregatePersistence {
     }
 
     fn replay_submissions(
-        &self,
+        &mut self,
         store: &mut AggregateStore,
         allowlist: &ReceiverAllowlist,
     ) -> Result<(), String> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT body_json
-                 FROM submissions
-                 ORDER BY submitted_at_ms ASC, rowid ASC",
-            )
-            .map_err(|error| sqlite_error(&self.db_path, "prepare replay", error))?;
-        let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| sqlite_error(&self.db_path, "query replay", error))?;
-
-        for (index, row) in rows.enumerate() {
-            let body_json =
-                row.map_err(|error| sqlite_error(&self.db_path, "read replay", error))?;
-            let submission =
-                serde_json::from_str::<SignedSubmission>(&body_json).map_err(|error| {
-                    format!(
-                        "{}:row {}: invalid signed submission JSON: {error}",
-                        self.db_path.display(),
-                        index + 1
-                    )
-                })?;
-            let payload = verified_submission_payload(allowlist, &submission).map_err(|error| {
-                format!("{}:row {}: {error}", self.db_path.display(), index + 1)
-            })?;
-            replay_verified_payload(
-                store,
-                &submission.submission_id,
-                payload,
-                submission.submitted_at_ms,
-            )
-            .map_err(|error| {
-                format!(
-                    "{}:row {}: invalid submission payload: {error}",
-                    self.db_path.display(),
-                    index + 1
+        let skipped_rowids = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT rowid, body_json
+                     FROM submissions
+                     ORDER BY submitted_at_ms ASC, rowid ASC",
                 )
-            })?;
+                .map_err(|error| sqlite_error(&self.db_path, "prepare replay", error))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| sqlite_error(&self.db_path, "query replay", error))?;
+
+            let mut skipped_rowids = Vec::new();
+            for (index, row) in rows.enumerate() {
+                let (rowid, body_json) =
+                    row.map_err(|error| sqlite_error(&self.db_path, "read replay", error))?;
+                let row_number = index + 1;
+                let submission = match serde_json::from_str::<SignedSubmission>(&body_json) {
+                    Ok(submission) => submission,
+                    Err(error) => {
+                        skipped_rowids.push(rowid);
+                        eprintln!(
+                            "{}:row {row_number}: skipping invalid signed submission JSON: {error}",
+                            self.db_path.display()
+                        );
+                        continue;
+                    }
+                };
+                let payload = match verified_submission_payload(allowlist, &submission) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        skipped_rowids.push(rowid);
+                        eprintln!(
+                            "{}:row {row_number}: skipping rejected submission: {error}",
+                            self.db_path.display()
+                        );
+                        continue;
+                    }
+                };
+                if let Err(error) = replay_verified_payload(
+                    store,
+                    &submission.submission_id,
+                    payload,
+                    submission.submitted_at_ms,
+                )
+                .map(|_| ())
+                {
+                    skipped_rowids.push(rowid);
+                    eprintln!(
+                        "{}:row {row_number}: skipping invalid submission payload: {error}",
+                        self.db_path.display()
+                    );
+                }
+            }
+
+            skipped_rowids
+        };
+
+        if !skipped_rowids.is_empty() {
+            let skipped_rows = usize_to_u64(skipped_rowids.len());
+            eprintln!(
+                "{}: skipped {skipped_rows} persisted aggregate submission rows during replay",
+                self.db_path.display()
+            );
+            if let Err(error) = self.delete_invalid_replay_rows(&skipped_rowids) {
+                eprintln!(
+                    "{}: failed to delete invalid replay rows: {error}",
+                    self.db_path.display()
+                );
+            }
         }
 
         Ok(())
@@ -845,6 +879,40 @@ impl AggregatePersistence {
         transaction
             .commit()
             .map_err(|error| sqlite_error(&db_path, "commit size delete", error))?;
+
+        Ok(removed)
+    }
+
+    fn delete_invalid_replay_rows(&mut self, rowids: &[i64]) -> Result<u64, String> {
+        if rowids.is_empty() {
+            return Ok(0);
+        }
+
+        let db_path = self.db_path.clone();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| sqlite_error(&db_path, "begin invalid replay delete", error))?;
+        let mut removed = 0_u64;
+        {
+            let mut statement = transaction
+                .prepare("DELETE FROM submissions WHERE rowid = ?1")
+                .map_err(|error| sqlite_error(&db_path, "prepare invalid replay delete", error))?;
+            for rowid in rowids {
+                let changed = statement
+                    .execute(params![rowid])
+                    .map_err(|error| sqlite_error(&db_path, "delete invalid replay row", error))?;
+                removed = removed.saturating_add(usize_to_u64(changed));
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| sqlite_error(&db_path, "commit invalid replay delete", error))?;
+
+        if removed > 0 {
+            self.reclaim_free_pages()?;
+        }
+        self.refresh_state(0)?;
 
         Ok(removed)
     }
@@ -1523,6 +1591,50 @@ mod tests {
         assert!(status.persistence.log_bytes.is_some_and(|bytes| bytes > 0));
         assert_eq!(status.persistence.log_records, Some(1));
         assert_eq!(status.persistence.last_error, None);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistence_replay_skips_invalid_cached_submission_rows() {
+        let signing_key = sample_signing_key();
+        let allowlist = allowlist_for(&signing_key);
+        let dir = temp_test_dir("rsdb-aggregate-invalid-cache-row");
+        let retention_ms = 24 * 60 * 60 * 1_000;
+        let max_bytes = 1_000_000;
+        let now_ms = unix_time_ms();
+        let good_submission = signed_submission_at(&signing_key, now_ms);
+        let mut bad_submission = signed_submission_at(&signing_key, now_ms + 1);
+        bad_submission.submission_id = "0".repeat(64);
+        let mut persistence = AggregatePersistence::open(&dir, retention_ms, max_bytes).unwrap();
+
+        persistence.append_submission(&good_submission).unwrap();
+        persistence.append_submission(&bad_submission).unwrap();
+        let restored_store = persistence.load_store(&allowlist).unwrap();
+        let restored_hub = Hub::with_store(allowlist, restored_store, Some(persistence));
+        let replayed = restored_hub
+            .submit(&serde_json::to_vec(&good_submission).unwrap())
+            .unwrap();
+        let bad_error = restored_hub
+            .submit(&serde_json::to_vec(&bad_submission).unwrap())
+            .unwrap_err();
+        let status = restored_hub.status_json();
+
+        assert!(replayed.duplicate);
+        assert!(matches!(bad_error, SubmitError::Rejected(_)));
+        assert_eq!(status.submissions_accepted, 1);
+        assert_eq!(status.submissions_duplicate, 1);
+        assert_eq!(status.submissions_rejected, 1);
+        assert_eq!(
+            stored_submission_count(&dir, &good_submission.submission_id),
+            1
+        );
+        assert_eq!(
+            stored_submission_count(&dir, &bad_submission.submission_id),
+            0
+        );
+        assert_eq!(status.persistence.log_records, Some(1));
+        assert_eq!(restored_hub.aircraft_json().aircraft.len(), 1);
 
         fs::remove_dir_all(dir).unwrap();
     }

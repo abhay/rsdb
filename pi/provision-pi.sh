@@ -88,6 +88,7 @@ RSDB_AGGREGATE_HOT_MAX_MB=250
 RSDB_SUBMIT_URLS=http://127.0.0.1:8090
 # RSDB_SUBMIT_URLS=http://127.0.0.1:8090,https://aggregate.example.com
 RSDB_SUBMIT_RETRY_SECONDS=5
+RSDB_SUBMIT_MAX_LAG_SECONDS=60
 RSDB_SUBMIT_OUTBOX_DIR=/var/lib/rsdb/submit
 RSDB_SUBMIT_OUTBOX_MAX_MB=25
 # RSDB_RECEIVER_LAT=fill-me-in
@@ -215,6 +216,7 @@ ensure_config_key RSDB_AGGREGATE_HOT_MAX_MB "RSDB_AGGREGATE_HOT_MAX_MB=250"
 ensure_config_key RSDB_SIGNING_KEY_PATH "# RSDB_SIGNING_KEY_PATH=/etc/rsdb/receiver.seed"
 ensure_config_key RSDB_SUBMIT_URLS "RSDB_SUBMIT_URLS=http://127.0.0.1:8090"
 ensure_config_key RSDB_SUBMIT_RETRY_SECONDS "RSDB_SUBMIT_RETRY_SECONDS=5"
+ensure_config_key RSDB_SUBMIT_MAX_LAG_SECONDS "RSDB_SUBMIT_MAX_LAG_SECONDS=60"
 ensure_config_key RSDB_SUBMIT_OUTBOX_DIR "RSDB_SUBMIT_OUTBOX_DIR=/var/lib/rsdb/submit"
 ensure_config_key RSDB_SUBMIT_OUTBOX_MAX_MB "RSDB_SUBMIT_OUTBOX_MAX_MB=25"
 
@@ -226,6 +228,9 @@ set_config_key RSDB_RECEIVER_LON "$receiver_lon"
 
 if [ -n "${RSDB_SUBMIT_URLS:-}" ]; then
     set_config_key RSDB_SUBMIT_URLS "$RSDB_SUBMIT_URLS"
+fi
+if [ -n "${RSDB_SUBMIT_MAX_LAG_SECONDS:-}" ]; then
+    set_config_key RSDB_SUBMIT_MAX_LAG_SECONDS "$RSDB_SUBMIT_MAX_LAG_SECONDS"
 fi
 
 if sudo test -f /etc/rsdb/receiver.seed; then

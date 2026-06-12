@@ -5,7 +5,7 @@ RSDB splits hardware collection from public serving.
 `rsdb-usb` is the hardware-adjacent receiver process. It opens the RTL-SDR,
 runs 1 configured radio job, maintains local receiver diagnostics, signs raw
 frame batches and heartbeat messages when a receiver seed is configured, and
-retries submissions through a durable local outbox.
+retries fresh submissions through a durable local outbox.
 
 `rsdb-aggregate` is the public data product. It verifies signed submissions,
 dedupes by submission ID, owns aggregate state through a single writer, persists
@@ -18,8 +18,8 @@ flowchart LR
   USB[RTL-SDR USB] --> Receiver[rsdb-usb<br/>receiver service]
   Receiver --> Decode[Protocol decoder<br/>ADS-B / Mode S today]
   Decode --> LocalAPI[Local diagnostics<br/>status, bootstrap, history, ws]
-  Decode --> Submit[Submission worker<br/>sign, queue, retry]
-  Submit --> Outbox[Durable outbox<br/>submission-outbox.ndjson]
+  Decode --> Submit[Submission worker<br/>coalesce, drop stale, retry]
+  Submit --> Outbox[Fresh durable outbox<br/>submission-outbox.ndjson]
   Outbox --> LocalAgg[Local aggregate<br/>rsdb-aggregate]
   Outbox -. optional HTTPS .-> RemoteAgg[Remote aggregate<br/>Fly.io or other host]
   LocalAgg --> Writer[Single aggregate writer<br/>verify, dedupe, mutate state]
@@ -48,7 +48,7 @@ rsdb-usb
            |
            v
        submission worker
-           sign -> append durable outbox -> retry POST
+           coalesce -> drop stale -> sign -> append durable outbox -> retry POST
            |
            +-- http://127.0.0.1:8090/submit
            +-- https://remote-aggregate.example.com/submit
@@ -80,8 +80,8 @@ sequenceDiagram
   USB->>R: IQ sample stream
   R->>R: demodulate configured protocol
   R->>R: update local receiver state
-  R->>Q: signed FrameRecordBatch aircraft data
-  R->>Q: signed heartbeat FeedMessage health data
+  R->>Q: fresh signed FrameRecordBatch aircraft data
+  R->>Q: fresh signed heartbeat FeedMessage health data
   Q->>A: POST /submit
   A->>A: verify allowlist and signature
   A->>A: enqueue to single aggregate writer
@@ -103,14 +103,15 @@ sequenceDiagram
 1. USB sends I/Q samples to rsdb-usb.
 2. The receiver decodes the configured protocol into protocol-tagged feed updates and frame records.
 3. The receiver updates its local diagnostic state.
-4. The submission worker signs frame batches for aircraft data and heartbeat messages for receiver health.
-5. The worker appends submissions to the durable outbox.
-6. The worker POSTs queued submissions to each configured aggregate /submit.
-7. The aggregate verifies the allowlist and signature.
-8. The HTTP worker queues the verified submission to the single writer.
-9. The writer dedupes submission_id and inserts accepted submissions into SQLite.
-10. The writer decodes frame batches into receiver-scoped state and broadcasts live FeedMessage updates.
-11. Browser/API clients bootstrap from HTTP JSON, then use WebSocket for live updates.
+4. The submission worker coalesces frame batches, measures payload lag, and drops rows older than the live freshness window.
+5. The worker signs frame batches for aircraft data and heartbeat messages for receiver health.
+6. The worker appends fresh submissions to the durable outbox.
+7. The worker POSTs queued submissions to each configured aggregate `/submit`.
+8. The aggregate verifies the allowlist and signature.
+9. The HTTP worker queues the verified submission to the single writer.
+10. The writer dedupes `submission_id` and inserts accepted submissions into SQLite.
+11. The writer decodes frame batches into receiver-scoped state and broadcasts live FeedMessage updates.
+12. Browser/API clients bootstrap from HTTP JSON, then use WebSocket for live updates.
 ```
 
 ## Protocol Boundary

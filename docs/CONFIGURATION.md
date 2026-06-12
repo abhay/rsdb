@@ -82,6 +82,7 @@ RSDB_RECEIVER_SEED_PATH=pi/secrets/receiver.seed
 RSDB_SIGNING_KEY_PATH=/etc/rsdb/receiver.seed
 RSDB_SUBMIT_URLS=http://127.0.0.1:8090
 RSDB_SUBMIT_RETRY_SECONDS=5
+RSDB_SUBMIT_MAX_LAG_SECONDS=60
 RSDB_SUBMIT_OUTBOX_DIR=/var/lib/rsdb/submit
 RSDB_SUBMIT_OUTBOX_MAX_MB=25
 ```
@@ -93,10 +94,12 @@ aggregates to `RSDB_SUBMIT_URLS` as a comma or whitespace separated list:
 RSDB_SUBMIT_URLS='http://127.0.0.1:8090,https://rsdb.hackshare.com'
 ```
 
-The outbox is durable. If an aggregate is unavailable, signed submissions remain
-queued and replay later. Submission IDs make replay idempotent at the aggregate.
-Aircraft data is submitted as signed frame batches; receiver health is submitted
-as signed heartbeat feed messages.
+The outbox is durable, but the live feed has a freshness limit. If an aggregate
+is unavailable or the sender falls behind, payloads older than
+`RSDB_SUBMIT_MAX_LAG_SECONDS` are dropped instead of being replayed as live
+traffic. Submission IDs make retry idempotent at the aggregate. Aircraft data is
+submitted as signed frame batches; receiver health is submitted as signed
+heartbeat feed messages.
 
 `RSDB_RECEIVER_SEED_PATH` is a laptop-side deploy helper created by
 `pi/init-receiver-node.sh`. `pi/push-and-provision.sh` installs that local seed to

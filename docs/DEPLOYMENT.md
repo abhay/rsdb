@@ -118,6 +118,7 @@ Keep the Pi local aggregate in the submit target list:
 
 ```sh
 RSDB_SUBMIT_URLS=http://127.0.0.1:8090
+RSDB_SUBMIT_MAX_LAG_SECONDS=60
 ```
 
 Add remote aggregates to the same list:
@@ -127,4 +128,6 @@ RSDB_SUBMIT_URLS=http://127.0.0.1:8090,https://rsdb.hackshare.com
 ```
 
 The receiver tracks pending destinations per submission. A local aggregate can
-drain while a remote aggregate stays queued for retry.
+drain while a remote aggregate stays queued for retry. Rows that age past
+`RSDB_SUBMIT_MAX_LAG_SECONDS` are dropped before replay so the shared aggregate
+does not ingest old data as live traffic.

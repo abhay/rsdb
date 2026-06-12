@@ -83,5 +83,8 @@ remote_env="RSDB_RECEIVER_LAT=$quoted_lat RSDB_RECEIVER_LON=$quoted_lon"
 if [ -n "${RSDB_SUBMIT_URLS:-}" ]; then
     remote_env="$remote_env RSDB_SUBMIT_URLS=$(shell_quote "$RSDB_SUBMIT_URLS")"
 fi
+if [ -n "${RSDB_SUBMIT_MAX_LAG_SECONDS:-}" ]; then
+    remote_env="$remote_env RSDB_SUBMIT_MAX_LAG_SECONDS=$(shell_quote "$RSDB_SUBMIT_MAX_LAG_SECONDS")"
+fi
 
 $ssh_cmd "$target" "cd ~/rsdb && $remote_env ./pi/provision-pi.sh"
