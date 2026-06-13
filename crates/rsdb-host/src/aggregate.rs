@@ -48,6 +48,12 @@ pub fn aggregate_api_schema() -> ApiSchema {
                 "Per-receiver aggregate summaries.",
             ),
             aggregate_endpoint(
+                "/route-lookup.json",
+                "GET",
+                "RouteLookupResponse",
+                "Best-effort free route hint inferred from RSDB-observed tracks near known airports.",
+            ),
+            aggregate_endpoint(
                 "/schema.json",
                 "GET",
                 "ApiSchema",

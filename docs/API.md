@@ -11,6 +11,7 @@ GET  /status.json      Aggregate health, receiver summaries, ingest counters
 GET  /aircraft.json    Receiver-scoped aggregate aircraft snapshot
 GET  /bootstrap.json   Current snapshot plus recent feed messages
 GET  /receivers.json   Receiver summaries
+GET  /route-lookup.json Best-effort route hint from observed tracks
 GET  /schema.json      Machine-readable endpoint and field contract
 GET  /agents.md        Agent-facing project guide generated from repo docs
 GET  /llms.txt         Same guide for clients that discover llms.txt
@@ -33,6 +34,11 @@ submissions.
 Live receivers submit aircraft data as signed `FrameRecordBatch` payloads. They
 still submit heartbeat `FeedMessage` payloads so aggregates can show receiver
 health, USB counters, receiver site, and submission outbox state.
+
+`GET /route-lookup.json?icao=A12A7F&callsign=UAL1572` returns a free,
+best-effort route hint inferred from RSDB-observed aircraft positions near known
+airports. It is labeled with `source: "rsdb_observed"` and a confidence level;
+it is not a filed flight plan.
 
 ## Receiver Diagnostics Endpoints
 

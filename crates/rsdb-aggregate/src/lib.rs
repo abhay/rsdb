@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod route_lookup;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
@@ -30,6 +32,7 @@ Allow: /status.json
 Allow: /bootstrap.json
 Allow: /aircraft.json
 Allow: /receivers.json
+Allow: /route-lookup.json
 Disallow: /submit
 ";
 const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
@@ -184,6 +187,9 @@ fn serve_http(mut stream: TcpStream, hub: &Hub, request: &HttpRequest) {
         }
         ("GET" | "HEAD", "/receivers.json") => {
             write_json_response(&mut stream, "200 OK", &hub.receivers_json());
+        }
+        ("GET" | "HEAD", "/route-lookup.json") => {
+            write_json_response(&mut stream, "200 OK", &hub.route_lookup_json(request));
         }
         ("GET" | "HEAD", "/schema.json") => {
             write_json_response(&mut stream, "200 OK", &rsdb::aggregate_api_schema());
@@ -505,6 +511,55 @@ impl HttpRequest {
         self.path
             .split_once('?')
             .map_or(self.path.as_str(), |(path, _)| path)
+    }
+
+    fn query_param(&self, name: &str) -> Option<String> {
+        let query = self.path.split_once('?')?.1;
+        query.split('&').find_map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            (url_decode(key) == name).then(|| url_decode(value))
+        })
+    }
+}
+
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                if let Some(decoded) = hex_pair(bytes[index + 1], bytes[index + 2]) {
+                    out.push(decoded);
+                    index += 3;
+                } else {
+                    out.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_pair(high: u8, low: u8) -> Option<u8> {
+    Some(hex_value(high)? * 16 + hex_value(low)?)
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1412,6 +1467,18 @@ impl Hub {
             .read()
             .expect("aggregate store rwlock not poisoned")
             .bootstrap(unix_time_ms())
+    }
+
+    fn route_lookup_json(&self, request: &HttpRequest) -> route_lookup::RouteLookupResponse {
+        let now_ms = unix_time_ms();
+        let icao = request.query_param("icao");
+        let callsign = request.query_param("callsign");
+        let messages = self
+            .store
+            .read()
+            .expect("aggregate store rwlock not poisoned")
+            .feed_messages(now_ms);
+        route_lookup::route_lookup(&messages, icao.as_deref(), callsign.as_deref())
     }
 
     fn receivers_json(&self) -> Vec<rsdb::AggregateReceiverSummary> {

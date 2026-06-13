@@ -7,10 +7,14 @@ const TRAIL_MAX_AGE_MS = 30 * 60 * 1000;
 const TRAIL_MIN_INTERVAL_MS = 5000;
 const TRAIL_MIN_MOVE_KM = 0.05;
 const EARTH_RADIUS_KM = 6371;
+const ROUTE_ENDPOINT_NEAR_KM = 120;
+const ROUTE_MISMATCH_MIN_EXCESS_KM = 300;
+const ROUTE_MISMATCH_EXCESS_RATIO = 0.25;
 const FIELD_RECENT_MS = 30 * 1000;
 const FIELD_STALE_MS = 2 * 60 * 1000;
 const RECEIVER_COLORS = ["#70d673", "#7fdcff", "#f7cb6f", "#e88a74", "#a78bfa", "#4cc8a3", "#f78fb3"];
 const REPOSITORY_URL = "https://github.com/abhay/rsdb";
+const AIRCRAFT_LOOKUP_BASE = "https://api.adsbdb.com/v0";
 
 const EMPTY_STATUS = {
   receiver_connected: false,
@@ -63,6 +67,8 @@ function App() {
   const [receiverOnly, setReceiverOnly] = useState(false);
   const [clockTick, setClockTick] = useState(0);
   const [bootstrapReady, setBootstrapReady] = useState(false);
+  const lookupCacheRef = useRef(new Map());
+  const [lookupVersion, setLookupVersion] = useState(0);
 
   const nowMs = serverClock(clockRef);
   const aggregateMode = isAggregateStatus(status);
@@ -157,9 +163,42 @@ function App() {
   }, [focusReceiverId]);
 
   const selectedItem = selectedKey ? displayItemMap.get(selectedKey) ?? null : null;
+  const selectedLookupKey = selectedItem ? lookupCacheKey(selectedItem) : null;
+
+  useEffect(() => {
+    if (!selectedItem || !selectedLookupKey) return;
+
+    const cached = lookupCacheRef.current.get(selectedLookupKey);
+    if (cached?.status === "loading" || cached?.status === "ready") return;
+
+    lookupCacheRef.current.set(selectedLookupKey, { status: "loading" });
+    setLookupVersion((version) => version + 1);
+
+    fetchAircraftLookup(selectedItem)
+      .then((lookup) => {
+        lookupCacheRef.current.set(selectedLookupKey, lookup);
+        setLookupVersion((version) => version + 1);
+      })
+      .catch((error) => {
+        lookupCacheRef.current.set(selectedLookupKey, {
+          status: "ready",
+          aircraft: null,
+          route: null,
+          errors: [error?.message ?? "Lookup unavailable"],
+        });
+        setLookupVersion((version) => version + 1);
+      });
+  }, [selectedItem, selectedLookupKey]);
+
+  const selectedLookup = selectedLookupKey
+    ? lookupCacheRef.current.get(selectedLookupKey) ?? { status: "idle" }
+    : null;
   const selectedTrail = selectedItem ? mergedTrail(selectedItem, trailsRef.current) : [];
   const totalAircraft = displayItems.length;
   const displayedAircraftCount = rows.length === totalAircraft ? totalAircraft : `${rows.length}/${totalAircraft}`;
+  const handleAircraftSelect = useCallback((key) => {
+    setSelectedKey((current) => current === key ? null : key);
+  }, []);
 
   return (
     <main className="shell">
@@ -170,7 +209,7 @@ function App() {
         nowMs={nowMs}
         socketState={socketState}
       />
-      <section className="ops-layout" aria-label="Live aircraft workspace">
+      <section className={`ops-layout ${selectedItem ? "has-selection" : "summary-collapsed"}`} aria-label="Live aircraft workspace">
         <aside className="left-rail">
           <Toolbar
             filter={filter}
@@ -197,7 +236,7 @@ function App() {
             nowMs={nowMs}
             receiverHandleCollisions={receiverHandleCollisions}
             onSort={(key) => updateSort(key, sortKey, setSortKey, setSortDir)}
-            onSelect={(key) => setSelectedKey(selectedKey === key ? null : key)}
+            onSelect={handleAircraftSelect}
           />
         </aside>
         <section className="center-panel" aria-label="Live coverage visualization">
@@ -207,18 +246,21 @@ function App() {
             receiverSite={receiverSite}
             receiverSites={receiverSites}
             focusReceiverId={focusReceiverId}
+            selectedKey={selectedKey}
             nowMs={nowMs}
+            onSelectAircraft={handleAircraftSelect}
           />
         </section>
         <aside className={`right-rail ${selectedItem ? "has-selection" : "summary-open"}`}>
           {selectedItem ? (
-          <DetailsPanel
-            item={selectedItem}
-            trail={selectedTrail}
-            nowMs={nowMs}
-            receiverHandleCollisions={receiverHandleCollisions}
-            onClose={() => setSelectedKey(null)}
-          />
+            <DetailsPanel
+              item={selectedItem}
+              trail={selectedTrail}
+              lookup={selectedLookup}
+              nowMs={nowMs}
+              receiverHandleCollisions={receiverHandleCollisions}
+              onClose={() => setSelectedKey(null)}
+            />
           ) : (
             <AggregateSummaryPanel status={status} statusReachable={statusReachable} nowMs={nowMs} />
           )}
@@ -228,7 +270,7 @@ function App() {
         <span>{aggregateMode ? "Aggregate" : "Collector"}</span>
         <span id="last-error">{status.last_error ?? ""}</span>
       </footer>
-      <span hidden>{clockTick}</span>
+      <span hidden>{clockTick}{lookupVersion}</span>
     </main>
   );
 }
@@ -240,14 +282,12 @@ function Header({ status, statusReachable, aircraftCount, nowMs, socketState }) 
     ? [
         ["RX", status.receiver_count ?? 0],
         ["AC", aircraftCount],
-        ["Accepted", status.submissions_accepted ?? 0],
         ["Last", age(status.last_submission_ms, nowMs)],
       ]
     : [
         ["RX", statusReachable ? status.receiver_connected ? "Live" : "Retry" : "Offline"],
         ["AC", aircraftCount],
         ["Frames", `${Number(status.decoded_frames_per_second ?? 0).toFixed(1)}/s`],
-        ["USB", megabytesPerSecond(status.usb_bytes_per_second)],
       ];
   const subhead = aggregateMode ? aggregateSubhead(status) : receiverSiteLabel(status.receiver_site);
 
@@ -469,7 +509,7 @@ function Toolbar({ filter, search, onFilterChange, onSearchChange }) {
   );
 }
 
-function DetailsPanel({ item, trail, nowMs, receiverHandleCollisions, onClose }) {
+function DetailsPanel({ item, trail, lookup, nowMs, receiverHandleCollisions, onClose }) {
   const groups = detailsGroups(item, trail, receiverHandleCollisions);
   const coverage = dataCoverage(item, nowMs);
   const decode = decodeState(item);
@@ -497,6 +537,7 @@ function DetailsPanel({ item, trail, nowMs, receiverHandleCollisions, onClose })
           </span>
         ))}
       </div>
+      <LookupPanel lookup={lookup} item={item} />
       <ObservationList item={item} nowMs={nowMs} receiverHandleCollisions={receiverHandleCollisions} />
       {groups.map((group) => (
         <section className="details-section" key={group.title}>
@@ -522,6 +563,112 @@ function DetailsPanel({ item, trail, nowMs, receiverHandleCollisions, onClose })
         ))}
       </ol>
     </aside>
+  );
+}
+
+function LookupPanel({ lookup, item }) {
+  const routeView = routeDisplayForItem(lookup?.route ?? null, item, lookup?.observed_route ?? null);
+  const state = lookupState(lookup, item, routeView);
+  const aircraft = lookup?.aircraft ?? null;
+  const route = routeView.route;
+  const hasResult = Boolean(aircraft || route || routeView.warning);
+
+  return (
+    <section className="details-section lookup-section">
+      <div className="lookup-head">
+        <h3>Lookup</h3>
+        <span className={`lookup-state lookup-state-${state.level}`}>{state.label}</span>
+      </div>
+      {lookup?.status === "loading" ? (
+        <div className="lookup-empty">Loading</div>
+      ) : hasResult ? (
+        <div className="lookup-body">
+          {aircraft && <AircraftLookupCard aircraft={aircraft} />}
+          {routeView.warning && <RouteLookupWarning route={routeView.withheldRoute} check={routeView.check} />}
+          {route && <RouteLookupCard route={route} />}
+        </div>
+      ) : (
+        <div className="lookup-empty">{lookup?.errors?.length ? "Lookup unavailable" : "No public lookup result"}</div>
+      )}
+    </section>
+  );
+}
+
+function RouteLookupWarning({ route, check }) {
+  return (
+    <article className="lookup-warning">
+      <strong>Route withheld</strong>
+      <p>
+        Public callsign lookup returned {routeAirportPair(route)}, but RSDB could not corroborate it from this aircraft's observed position or route.
+      </p>
+      {check?.level === "mismatch" && check?.excessKm > 0 && (
+        <span>{Math.round(check.excessKm).toLocaleString("en-US")} km off route</span>
+      )}
+    </article>
+  );
+}
+
+function AircraftLookupCard({ aircraft }) {
+  const photo = textOrNull(aircraft.url_photo_thumbnail) ?? textOrNull(aircraft.url_photo);
+
+  return (
+    <article className={`lookup-card ${photo ? "has-photo" : ""}`}>
+      {photo && (
+        <img
+          src={photo}
+          alt={lookupText(aircraft.registration, aircraft.icao_type, "Aircraft")}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+        />
+      )}
+      <dl className="details-grid lookup-grid">
+        <DetailField label="Registration" value={lookupText(aircraft.registration)} />
+        <DetailField label="Type" value={aircraftTypeLabel(aircraft)} />
+        <DetailField label="Manufacturer" value={lookupText(aircraft.manufacturer)} />
+        <DetailField label="Owner" value={lookupText(aircraft.registered_owner)} />
+        <DetailField label="Operator" value={lookupText(aircraft.registered_owner_operator_flag_code)} />
+        <DetailField label="Country" value={lookupText(aircraft.registered_owner_country_name)} />
+      </dl>
+    </article>
+  );
+}
+
+function RouteLookupCard({ route }) {
+  const origin = route.origin ?? null;
+  const destination = route.destination ?? null;
+
+  return (
+    <article className="route-card">
+      <dl className="details-grid lookup-grid">
+        <DetailField label="Flight" value={lookupText(route.callsign_iata, route.callsign_icao, route.callsign)} />
+        <DetailField label="Airline" value={airlineLabel(route.airline)} />
+        <DetailField label="Source" value={routeSourceLabel(route)} />
+        <DetailField label="Confidence" value={routeConfidenceLabel(route)} />
+      </dl>
+      <div className="route-pair">
+        <AirportBlock label="Origin" airport={origin} />
+        <AirportBlock label="Destination" airport={destination} />
+      </div>
+    </article>
+  );
+}
+
+function AirportBlock({ label: labelText, airport }) {
+  return (
+    <section className="airport-block">
+      <span>{labelText}</span>
+      <strong>{airportCodeLabel(airport)}</strong>
+      <p>{airportNameLabel(airport)}</p>
+    </section>
+  );
+}
+
+function DetailField({ label: labelText, value }) {
+  return (
+    <div className={value === "-" ? "detail-field detail-field-missing" : "detail-field"}>
+      <dt>{labelText}</dt>
+      <dd>{value}</dd>
+    </div>
   );
 }
 
@@ -746,6 +893,59 @@ function connectWebSocket(handleFeed, setSocketState) {
   };
 }
 
+async function fetchAircraftLookup(item) {
+  const icao = normalizedIcao(item.icao);
+  const callsign = normalizedCallsign(item.callsign);
+  const [aircraftResult, routeResult, observedRouteResult] = await Promise.all([
+    lookupResult(icao ? fetchLookupRecord(`/aircraft/${encodeURIComponent(icao)}`) : Promise.resolve(null)),
+    lookupResult(callsign ? fetchLookupRecord(`/callsign/${encodeURIComponent(callsign)}`) : Promise.resolve(null)),
+    lookupResult(fetchObservedRouteLookup(icao, callsign)),
+  ]);
+  const errors = [aircraftResult.error, routeResult.error, observedRouteResult.error]
+    .filter(Boolean)
+    .map((error) => error.message);
+
+  return {
+    status: "ready",
+    aircraft: aircraftResult.value?.aircraft ?? null,
+    route: routeResult.value?.flightroute ?? null,
+    observed_route: observedRouteResult.value?.route ?? null,
+    errors,
+  };
+}
+
+async function lookupResult(promise) {
+  try {
+    return { value: await promise, error: null };
+  } catch (error) {
+    return { value: null, error };
+  }
+}
+
+async function fetchLookupRecord(path) {
+  const response = await fetch(`${AIRCRAFT_LOOKUP_BASE}${path}`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Lookup HTTP ${response.status}`);
+
+  const payload = await response.json();
+  return payload?.response && typeof payload.response === "object" ? payload.response : null;
+}
+
+async function fetchObservedRouteLookup(icao, callsign) {
+  const query = new URLSearchParams();
+  if (icao) query.set("icao", icao);
+  if (callsign) query.set("callsign", callsign);
+  if (!query.toString()) return null;
+
+  const response = await fetch(`/route-lookup.json?${query.toString()}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`Observed route HTTP ${response.status}`);
+  return response.json();
+}
+
+function lookupCacheKey(item) {
+  return `${normalizedIcao(item.icao)}|${normalizedCallsign(item.callsign)}`;
+}
+
 function applyBootstrap(bootstrap, aircraft, trails, clockRef) {
   setServerTime(clockRef, bootstrap.now_ms);
   aircraft.clear();
@@ -815,6 +1015,28 @@ function fmt(value, suffix = "") {
 
 function fixed(value, digits, suffix = "") {
   return numeric(value) ? `${Number(value).toFixed(digits)}${suffix}` : "-";
+}
+
+function textOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  return text === "" ? null : text;
+}
+
+function lookupText(...values) {
+  for (const value of values) {
+    const text = textOrNull(value);
+    if (text) return text;
+  }
+  return "-";
+}
+
+function normalizedIcao(value) {
+  return (textOrNull(value) ?? "").toUpperCase();
+}
+
+function normalizedCallsign(value) {
+  return (textOrNull(value) ?? "").replace(/\s+/g, "").toUpperCase();
 }
 
 function label(value) {
@@ -969,6 +1191,154 @@ function hasVelocity(item) {
 
 function displayName(item) {
   return item.callsign || item.icao;
+}
+
+function lookupState(lookup, item, routeView = null) {
+  if (!lookup || lookup.status === "idle") return { level: "idle", label: "Waiting" };
+  if (lookup.status === "loading") return { level: "loading", label: "Loading" };
+  const view = routeView ?? routeDisplayForItem(lookup.route, item, lookup.observed_route);
+  if (view.warning) {
+    return { level: "warning", label: lookup.aircraft ? "Partial" : "Unverified" };
+  }
+  if (lookup.aircraft || view.route) return { level: "ready", label: view.route?.source === "rsdb_observed" ? "Inferred" : "Found" };
+  if (lookup.errors?.length) return { level: "error", label: "Error" };
+  return { level: "missing", label: "None" };
+}
+
+function routeDisplayForItem(route, item, observedRoute = null) {
+  const check = routePositionCheck(item, route);
+  if (route && routeConflictsWithObserved(route, observedRoute)) {
+    return {
+      route: observedRoute,
+      warning: true,
+      check: { ...check, level: "mismatch" },
+      withheldRoute: route,
+    };
+  }
+  if (route && publicRouteCorroborated(route, observedRoute, check)) {
+    return { route, warning: false, check, withheldRoute: null };
+  }
+  if (route) {
+    return {
+      route: observedRoute,
+      warning: true,
+      check: check.level === "unknown" ? { ...check, level: "unverified" } : check,
+      withheldRoute: route,
+    };
+  }
+  return { route: observedRoute, warning: false, check, withheldRoute: null };
+}
+
+function routePositionCheck(item, route) {
+  const origin = airportPoint(route?.origin);
+  const destination = airportPoint(route?.destination);
+  if (!route || !origin || !destination || !item || !hasPosition(item)) {
+    return { level: "unknown" };
+  }
+
+  const routeKm = haversineDistanceKm(origin.lat, origin.lon, destination.lat, destination.lon);
+  if (!(routeKm > 0)) return { level: "unknown" };
+
+  const fromOriginKm = haversineDistanceKm(origin.lat, origin.lon, item.lat, item.lon);
+  const toDestinationKm = haversineDistanceKm(item.lat, item.lon, destination.lat, destination.lon);
+  const nearestEndpointKm = Math.min(fromOriginKm, toDestinationKm);
+  const excessKm = Math.max(0, fromOriginKm + toDestinationKm - routeKm);
+  const allowedExcessKm = Math.max(ROUTE_MISMATCH_MIN_EXCESS_KM, routeKm * ROUTE_MISMATCH_EXCESS_RATIO);
+
+  if (nearestEndpointKm <= ROUTE_ENDPOINT_NEAR_KM || excessKm <= allowedExcessKm) {
+    return { level: "plausible", routeKm, excessKm, nearestEndpointKm };
+  }
+  return { level: "mismatch", routeKm, excessKm, nearestEndpointKm };
+}
+
+function airportPoint(airport) {
+  if (!airport || !numeric(airport.latitude) || !numeric(airport.longitude)) return null;
+  return { lat: airport.latitude, lon: airport.longitude };
+}
+
+function routeAirportPair(route) {
+  return `${airportShortCode(route?.origin)} to ${airportShortCode(route?.destination)}`;
+}
+
+function airportShortCode(airport) {
+  return lookupText(airport?.iata_code, airport?.icao_code);
+}
+
+function publicRouteCorroborated(route, observedRoute, check) {
+  if (check?.nearestEndpointKm <= ROUTE_ENDPOINT_NEAR_KM) return true;
+  return routeSharesObservedEndpoint(route, observedRoute);
+}
+
+function routeConflictsWithObserved(route, observedRoute) {
+  if (!route || !observedRoute) return false;
+  const observedEndpoints = [observedRoute.origin, observedRoute.destination].filter(Boolean);
+  if (observedEndpoints.length === 0) return false;
+  return observedEndpoints.every((airport) => !routeHasAirport(route, airport));
+}
+
+function routeSharesObservedEndpoint(route, observedRoute) {
+  if (!route || !observedRoute) return false;
+  return [observedRoute.origin, observedRoute.destination]
+    .filter(Boolean)
+    .some((airport) => routeHasAirport(route, airport));
+}
+
+function routeHasAirport(route, airport) {
+  return sameAirport(route.origin, airport) || sameAirport(route.destination, airport);
+}
+
+function sameAirport(left, right) {
+  if (!left || !right) return false;
+  const leftCodes = airportCodes(left);
+  const rightCodes = airportCodes(right);
+  return leftCodes.some((code) => rightCodes.includes(code));
+}
+
+function airportCodes(airport) {
+  return [airport.icao_code, airport.iata_code]
+    .map(textOrNull)
+    .filter(Boolean)
+    .map((code) => code.toUpperCase());
+}
+
+function routeSourceLabel(route) {
+  if (route?.source_label) return route.source_label;
+  if (route?.source === "rsdb_observed") return "RSDB observed";
+  return "Public lookup";
+}
+
+function routeConfidenceLabel(route) {
+  if (route?.confidence === "medium") return "Medium";
+  if (route?.confidence === "low") return "Low";
+  return route?.source === "rsdb_observed" ? "Low" : "Public";
+}
+
+function aircraftTypeLabel(aircraft) {
+  const type = textOrNull(aircraft.type);
+  const icaoType = textOrNull(aircraft.icao_type);
+  if (type && icaoType && type !== icaoType) return `${type} / ${icaoType}`;
+  return lookupText(type, icaoType);
+}
+
+function airlineLabel(airline) {
+  if (!airline) return "-";
+  const name = textOrNull(airline.name);
+  const codes = [airline.iata, airline.icao].map(textOrNull).filter(Boolean).join(" / ");
+  return lookupText(name && codes ? `${name} / ${codes}` : name, codes);
+}
+
+function airportCodeLabel(airport) {
+  if (!airport) return "-";
+  const codes = [airport.icao_code, airport.iata_code].map(textOrNull).filter(Boolean).join(" / ");
+  return lookupText(codes);
+}
+
+function airportNameLabel(airport) {
+  if (!airport) return "-";
+  const name = textOrNull(airport.name);
+  const municipality = textOrNull(airport.municipality);
+  if (name && municipality && !name.includes(municipality)) return `${name}, ${municipality}`;
+  return lookupText(name, municipality);
 }
 
 function aircraftKey(icao, receiverIdentity) {

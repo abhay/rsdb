@@ -15,7 +15,7 @@ import { SimpleMeshLayer } from "@deck.gl/mesh-layers";
 // Constants
 // ----------------------------------------------------------------------
 const FT_TO_KM = 0.0003048; // feet -> km
-const MAX_POINTS = 150000; // capped rolling cloud (ring-buffer once full)
+const MAX_POINTS = 150000; // capped rolling samples (ring-buffer once full)
 const DEG_KM = 111.194; // km per degree of latitude
 const REANCHOR_DRIFT_KM = 25; // floating centroid re-anchor threshold
 
@@ -53,24 +53,40 @@ const GRID_STEP = 50;
 // Range rings (closed 72-seg loops).
 const RING_RADII = [25, 50, 100, 150, 200, 250];
 
-// The 7 layer-visibility chips (deck layers only; Profile/Slice are DOM panels).
+// Deck layer-visibility chips only; Profile/Slice are DOM panels.
 const LAYER_CHIPS = [
-  ["cloud", "Coverage"],
   ["planes", "Planes"],
   ["trails", "Trails"],
-  ["rings", "Rings"],
-  ["grid", "Grid"],
   ["basemap", "Map"],
-  ["hull", "Hull"],
+  ["rings", "Rings"],
+  ["coverage", "Coverage"],
+  ["samples", "Samples"],
+  ["grid", "Grid"],
 ];
 
 // One module-level plane silhouette data-URL (points +Y / north at angle 0).
 // mask:true lets getColor tint it by altitude. Same object reused every frame.
 const PLANE_DATAURL = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDY0IDY0Ij48cGF0aCBmaWxsPSIjZmZmZmZmIiBkPSJNMzIgMyBDMzAgMyAyOC41IDUgMjguMiA5LjUgTDI3LjYgMjQgTDYgMzYgTDYgNDEgTDI3LjQgMzUuMiBMMjcuMSA0OSBMMTkgNTQgTDE5IDU4IEwzMiA1NS41IEw0NSA1OCBMNDUgNTQgTDM2LjkgNDkgTDM2LjYgMzUuMiBMNTggNDEgTDU4IDM2IEwzNi40IDI0IEwzNS44IDkuNSBDMzUuNSA1IDM0IDMgMzIgMyBaIi8+PC9zdmc+";
 const PLANE_ICON = { url: PLANE_DATAURL, width: 64, height: 64, anchorX: 32, anchorY: 32, mask: true };
+const SELECTED_COLOR = [245, 203, 98];
+const TRAIL_COLOR = [121, 211, 239];
+const SAMPLE_ALPHA = 92;
+const AIRCRAFT_VARIANTS = {
+  light: { key: "light", label: "Light", model: "air", scale: [0.82, 0.78, 0.82], tint: [133, 232, 188] },
+  narrow: { key: "narrow", label: "Narrow-body", model: "air", scale: [1, 0.9, 0.95], tint: [121, 211, 239] },
+  long: { key: "long", label: "Long-range", model: "air", scale: [1.16, 0.84, 0.92], tint: [167, 139, 250] },
+  heavy: { key: "heavy", label: "Heavy", model: "air", scale: [1.32, 1.18, 1.05], tint: [247, 203, 111] },
+  rotor: { key: "rotor", label: "Rotorcraft", model: "heli", scale: [0.9, 0.9, 0.95], tint: [232, 138, 116] },
+};
+const FALLBACK_VARIANTS = [
+  AIRCRAFT_VARIANTS.light,
+  AIRCRAFT_VARIANTS.narrow,
+  AIRCRAFT_VARIANTS.long,
+  AIRCRAFT_VARIANTS.heavy,
+];
 
 // ----------------------------------------------------------------------
-// Colormap — single source of truth. Feeds cloud, hull, slice, and legend.
+// Colormap — single source of truth. Feeds samples, coverage, slice, and legend.
 // Turbo-like, dark -> bright. Domain: altitude in FEET, t = clamp(alt/45000).
 // ----------------------------------------------------------------------
 const TURBO = [
@@ -102,7 +118,7 @@ function altColor(altFt) {
   return turboAt(altFt / 45000);
 }
 
-// 256-entry altitude->color LUT so the cloud build loop indexes instead of interpolating.
+// 256-entry altitude->color LUT so the sample build loop indexes instead of interpolating.
 const ALT_LUT = new Uint8Array(256 * 3);
 for (let i = 0; i < 256; i++) {
   const c = altColor((i / 255) * 45000);
@@ -119,8 +135,24 @@ function altColorA(altFt, alpha) {
   const c = altColor(altFt);
   return [c[0], c[1], c[2], alpha];
 }
+function aircraftColorA(a, alpha) {
+  if (a.selected) return [SELECTED_COLOR[0], SELECTED_COLOR[1], SELECTED_COLOR[2], alpha];
+  const c = mixColor(altColor(a.alt_ft), a.tint, 0.24);
+  return [c[0], c[1], c[2], alpha];
+}
+function trailColorA(a, alpha) {
+  const c = a.selected ? SELECTED_COLOR : TRAIL_COLOR;
+  return [c[0], c[1], c[2], alpha];
+}
 function rgbStr(c) {
   return "rgb(" + c[0] + "," + c[1] + "," + c[2] + ")";
+}
+function mixColor(base, tint, amount) {
+  return [
+    Math.round(base[0] + (tint[0] - base[0]) * amount),
+    Math.round(base[1] + (tint[1] - base[1]) * amount),
+    Math.round(base[2] + (tint[2] - base[2]) * amount),
+  ];
 }
 
 // ----------------------------------------------------------------------
@@ -138,6 +170,26 @@ function itemAltitudeFt(item) {
   if (numeric(item.altitude_baro_ft)) return item.altitude_baro_ft;
   if (numeric(item.altitude_geometric_ft)) return item.altitude_geometric_ft;
   return 0;
+}
+
+function aircraftVariant(item) {
+  const category = numeric(item.category) ? item.category : null;
+  if (category === 7) return AIRCRAFT_VARIANTS.rotor;
+  if (category >= 5) return AIRCRAFT_VARIANTS.heavy;
+  if (category === 4) return AIRCRAFT_VARIANTS.long;
+  if (category === 3) return AIRCRAFT_VARIANTS.narrow;
+  if (category === 1 || category === 2) return AIRCRAFT_VARIANTS.light;
+
+  const key = item.icao || item.callsign || item.key || "";
+  return FALLBACK_VARIANTS[stringHash(key) % FALLBACK_VARIANTS.length];
+}
+
+function stringHash(value) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
 }
 
 function mergedItemTrail(item, trails) {
@@ -494,7 +546,7 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Fresh accumulator anchored at an origin (clears cloud/envelope/lastSeen/icaoSeen).
+// Fresh accumulator anchored at an origin (clears samples/envelope/lastSeen/icaoSeen).
 function makeAccumulator(anchor) {
   return {
     origin: anchor.origin,
@@ -502,9 +554,9 @@ function makeAccumulator(anchor) {
     anchorKey: anchor.key,
     anchorLabel: anchor.label,
     enu: makeEnu(anchor.origin),
-    cloud: new Float32Array(MAX_POINTS * 3), // [east, north, alt_ft] ring buffer
-    cloudCount: 0, // number of valid slots filled
-    cloudHead: 0, // next write index (wraps once full)
+    cloud: new Float32Array(MAX_POINTS * 3), // [east, north, alt_ft] sample ring buffer
+    cloudCount: 0, // number of valid sample slots filled
+    cloudHead: 0, // next sample write index (wraps once full)
     cloudFull: false,
     lastSeen: new Map(), // icao -> { east, north, altFt, timeMs }
     trailCursor: new Map(), // icao -> newest trail timestamp already seeded
@@ -524,7 +576,7 @@ function bearingFromEnu(east, north) {
 }
 
 // Run one accumulation pass over positioned items at time nowMs.
-// Returns true if the cloud or envelope changed (so a deck rebuild is warranted).
+// Returns true if the samples or envelope changed (so a deck rebuild is warranted).
 function accumulate(acc, items, trails, nowMs) {
   let changed = false;
   for (const item of items) {
@@ -615,13 +667,13 @@ function accumulateSample(acc, icao, sample) {
 }
 
 // ----------------------------------------------------------------------
-// Coverage binary build — EXAG + altitude color baked into typed arrays.
+// Diagnostic sample binary build — EXAG + altitude color baked into typed arrays.
 // New object reference -> deck shallow-compare fires the GPU upload once.
 // ----------------------------------------------------------------------
-function buildCoverageBinary(acc, exag) {
+function buildSampleBinary(acc, exag) {
   const N = acc.cloudCount;
   const posF32 = new Float32Array(N * 3);
-  const colU8 = new Uint8Array(N * 3);
+  const colU8 = new Uint8Array(N * 4);
   for (let i = 0; i < N; i++) {
     const e = acc.cloud[i * 3];
     const n = acc.cloud[i * 3 + 1];
@@ -630,27 +682,28 @@ function buildCoverageBinary(acc, exag) {
     posF32[i * 3 + 1] = n;
     posF32[i * 3 + 2] = altFt * FT_TO_KM * exag; // display Z baked here, NOT in the layer
     const idx = altColorLUT(altFt);
-    colU8[i * 3] = ALT_LUT[idx];
-    colU8[i * 3 + 1] = ALT_LUT[idx + 1];
-    colU8[i * 3 + 2] = ALT_LUT[idx + 2];
+    colU8[i * 4] = ALT_LUT[idx];
+    colU8[i * 4 + 1] = ALT_LUT[idx + 1];
+    colU8[i * 4 + 2] = ALT_LUT[idx + 2];
+    colU8[i * 4 + 3] = SAMPLE_ALPHA;
   }
   return {
     length: N,
     attributes: {
       getPosition: { value: posF32, size: 3 },
-      getColor: { value: colU8, size: 3, normalized: true },
+      getColor: { value: colU8, size: 4, normalized: true },
     },
   };
 }
 
 // ----------------------------------------------------------------------
-// Coverage hull mesh (SimpleMeshLayer, single indexed shell) from the envelope.
+// Coverage envelope mesh (SimpleMeshLayer, single indexed shell).
 // ----------------------------------------------------------------------
 function vIdx(level, col) {
   return level * HULL_RING_STRIDE + col;
 }
 
-function buildHullMesh(acc, exag, hullIndicesRef) {
+function buildCoverageMesh(acc, exag, hullIndicesRef) {
   const nLev = ENV_ALT_LEVELS; // 21
   const DEG = Math.PI / 180;
   const nVerts = nLev * HULL_RING_STRIDE;
@@ -702,6 +755,26 @@ function buildHullMesh(acc, exag, hullIndicesRef) {
   };
 }
 
+function buildCoverageContours(acc, exag) {
+  const contours = [];
+  const DEG = Math.PI / 180;
+  for (let L = 0; L < ENV_ALT_LEVELS; L += 4) {
+    const altFt = L * ENV_ALT_STEP;
+    const z = altFt * FT_TO_KM * exag;
+    const points = [];
+    let hasRange = false;
+    for (let c = 0; c <= ENV_BINS; c++) {
+      const bc = c % ENV_BINS;
+      const rangeKm = acc.envelope[L * ENV_BINS + bc] || 0;
+      if (rangeKm > 0) hasRange = true;
+      const th = bc * ENV_BIN_DEG * DEG;
+      points.push([rangeKm * Math.sin(th), rangeKm * Math.cos(th), z]);
+    }
+    if (hasRange) contours.push({ altFt, points });
+  }
+  return contours;
+}
+
 // Reduce the envelope to a profile: per alt-level, the max range across bearings.
 function reduceProfile(acc) {
   const pts = [];
@@ -738,7 +811,16 @@ function envelopeRangeAt(profileData, altFt) {
 // CoverageScope — the whole deck.gl visualization as a Preact component.
 // deck.gl is imported from @deck.gl/* and bundled into app.js by `bun build`.
 // ----------------------------------------------------------------------
-export default function CoverageScope({ items, trails, receiverSite, receiverSites = [], focusReceiverId = null, nowMs }) {
+export default function CoverageScope({
+  items,
+  trails,
+  receiverSite,
+  receiverSites = [],
+  focusReceiverId = null,
+  selectedKey = null,
+  nowMs,
+  onSelectAircraft,
+}) {
   const containerRef = useRef(null);
   const deckRef = useRef(null);
   const accRef = useRef(null);
@@ -749,17 +831,17 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
 
   // Controls (Preact state).
   const [exag, setExag] = useState(8);
-  const [pointSize, setPointSize] = useState(2);
+  const [pointSize, setPointSize] = useState(1.5);
   const [planeStyle, setPlaneStyle] = useState("model"); // 'model' | 'icon'
   const [modelScale, setModelScale] = useState(0.3);
   const [visible, setVisible] = useState({
-    cloud: true,
     planes: true,
     trails: true,
     rings: true,
-    grid: true,
     basemap: true,
-    hull: false,
+    coverage: false,
+    samples: false,
+    grid: false,
   });
   const [sliceOpen, setSliceOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
@@ -830,6 +912,7 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
       const north = enuPt[1];
       const altFt = itemAltitudeFt(item);
       const track = numeric(item.track_deg) ? item.track_deg : numeric(item.heading_deg) ? item.heading_deg : 0;
+      const variant = aircraftVariant(item);
       // Rolled-up display items key on bare ICAO, but trails are stored per
       // observation (receiverId:icao in aggregate mode). Merge across source_keys
       // (mirrors main.jsx mergedTrail), falling back to item.key for collector mode.
@@ -840,6 +923,7 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
           return [tp[0], tp[1], altFt];
         });
       out.push({
+        key: item.key ?? item.icao,
         hex: item.icao,
         flight: item.callsign || null,
         east_km: east,
@@ -848,13 +932,18 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
         track: track,
         gs: numeric(item.ground_speed_kt) ? item.ground_speed_kt : numeric(item.airspeed_kt) ? item.airspeed_kt : 0,
         dist_km: numeric(item.distance_km) ? item.distance_km : Math.hypot(east, north),
-        category: typeof item.category === "string" ? item.category : null,
+        category: numeric(item.category) ? item.category : null,
+        model_kind: variant.model,
+        model_label: variant.label,
+        model_scale: variant.scale,
+        tint: variant.tint,
+        selected: (item.key ?? item.icao) === selectedKey,
         vrate: numeric(item.vertical_rate_fpm) ? item.vertical_rate_fpm : null,
         trail: trail,
       });
     }
     return out;
-  }, [items, trails, dataTick]);
+  }, [items, trails, selectedKey, dataTick]);
 
   // ------------------------------------------------------------------
   // Mount the single Deck instance. Cleanup finalizes the GL context.
@@ -885,8 +974,9 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
       return {
         html:
           "<b>" + (o.flight || o.hex) + "</b><br/>" +
-          o.alt_ft + " ft &middot; " + gs + " kt<br/>" +
-          dist + " km",
+          (o.model_label || "Aircraft") + " &middot; " + o.alt_ft + " ft<br/>" +
+          gs + " kt &middot; " + dist + " km<br/>" +
+          "Click to select",
       };
     };
 
@@ -938,6 +1028,14 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
     const CARTESIAN = COORDINATE_SYSTEM.CARTESIAN;
     const topZ = 14 * exag;
     const layers = [];
+    const selectedData = liveData.filter((aircraft) => aircraft.selected);
+    const planePosition = (a) => [a.east_km, a.north_km, a.alt_ft * FT_TO_KM * exag];
+    const selectAircraft = (info) => {
+      const key = info?.object?.key;
+      if (!key || !onSelectAircraft) return false;
+      onSelectAircraft(key);
+      return true;
+    };
 
     // Basemap mosaic (flat slippy z8 tiles -> ENU bounds). Bottom of the stack.
     if (visible.basemap) {
@@ -1015,40 +1113,56 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
       parameters: { depthTest: true },
     }));
 
-    // Coverage hull — SimpleMeshLayer (single indexed shell), BEFORE the cloud.
-    if (visible.hull) {
-      const hullMesh = buildHullMesh(acc, exag, hullIndicesRef);
-      if (hullMesh) {
+    // Coverage reach — aggregate envelope from accumulated receiver samples.
+    if (visible.coverage) {
+      const coverageMesh = buildCoverageMesh(acc, exag, hullIndicesRef);
+      if (coverageMesh) {
         layers.push(new SimpleMeshLayer({
-          id: "hull",
+          id: "coverage-envelope",
           data: SINGLE_INSTANCE,
-          mesh: hullMesh,
+          mesh: coverageMesh,
           coordinateSystem: CARTESIAN,
           getPosition: (d) => d.position,
           getColor: [255, 255, 255, 255],
           material: false,
-          opacity: 0.22,
+          opacity: 0.2,
           wireframe: false,
           pickable: false,
           updateTriggers: { mesh: [exag, dataTick] },
           parameters: { depthTest: true, depthMask: false, cull: false },
         }));
       }
+
+      layers.push(new PathLayer({
+        id: "coverage-contours",
+        data: buildCoverageContours(acc, exag),
+        coordinateSystem: CARTESIAN,
+        getPath: (d) => d.points,
+        getColor: (d) => altColorA(d.altFt, 145),
+        getWidth: 1.2,
+        widthUnits: "pixels",
+        widthMinPixels: 1,
+        jointRounded: true,
+        capRounded: true,
+        updateTriggers: { getPath: [exag, dataTick], getColor: dataTick },
+        parameters: { depthTest: true, depthMask: false },
+      }));
     }
 
-    // Coverage cloud (THE CONE) — PointCloudLayer, binary typed-array form.
-    const coverageBinary = buildCoverageBinary(acc, exag);
-    layers.push(new PointCloudLayer({
-      id: "coverage",
-      data: coverageBinary,
-      coordinateSystem: CARTESIAN,
-      material: false,
-      pointSize: pointSize,
-      sizeUnits: "pixels",
-      pickable: false,
-      visible: visible.cloud,
-      parameters: { depthTest: true },
-    }));
+    // Raw position samples are diagnostic; trails are the live aircraft paths.
+    if (visible.samples) {
+      layers.push(new PointCloudLayer({
+        id: "samples",
+        data: buildSampleBinary(acc, exag),
+        coordinateSystem: CARTESIAN,
+        material: false,
+        pointSize: pointSize,
+        sizeUnits: "pixels",
+        opacity: 0.7,
+        pickable: false,
+        parameters: { depthTest: true },
+      }));
+    }
 
     // Station marker — vertical reference LineLayer + bright origin dot.
     layers.push(new LineLayer({
@@ -1081,19 +1195,34 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
 
     // Motion trails — PathLayer (drawn before planes).
     layers.push(new PathLayer({
+      id: "trail-glow",
+      data: liveData,
+      coordinateSystem: CARTESIAN,
+      getPath: (a) => a.trail.map((t) => [t[0], t[1], t[2] * FT_TO_KM * exag]),
+      getColor: (a) => trailColorA(a, a.selected ? 90 : 42),
+      getWidth: (a) => a.selected ? 7 : 4,
+      widthUnits: "pixels",
+      widthMinPixels: 2,
+      jointRounded: true,
+      capRounded: true,
+      visible: visible.trails,
+      updateTriggers: { getPath: [exag, dataTick], getColor: selectedKey, getWidth: selectedKey },
+      parameters: { depthTest: false, depthMask: false },
+    }));
+    layers.push(new PathLayer({
       id: "trails",
       data: liveData,
       coordinateSystem: CARTESIAN,
       getPath: (a) => a.trail.map((t) => [t[0], t[1], t[2] * FT_TO_KM * exag]),
-      getColor: (a) => altColorA(a.alt_ft, 150),
-      getWidth: 2,
+      getColor: (a) => trailColorA(a, a.selected ? 235 : 150),
+      getWidth: (a) => a.selected ? 3.5 : 1.8,
       widthUnits: "pixels",
-      widthMinPixels: 1.5,
+      widthMinPixels: 1.25,
       jointRounded: true,
       capRounded: true,
       visible: visible.trails,
-      updateTriggers: { getPath: [exag, dataTick], getColor: dataTick },
-      parameters: { depthTest: true },
+      updateTriggers: { getPath: [exag, dataTick], getColor: selectedKey, getWidth: selectedKey },
+      parameters: { depthTest: false, depthMask: false },
     }));
 
     // Altitude drop-lines — LineLayer (depth cue, just under planes).
@@ -1101,15 +1230,33 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
       id: "droplines",
       data: liveData,
       coordinateSystem: CARTESIAN,
-      getSourcePosition: (a) => [a.east_km, a.north_km, a.alt_ft * FT_TO_KM * exag],
+      getSourcePosition: planePosition,
       getTargetPosition: (a) => [a.east_km, a.north_km, 0],
-      getColor: (a) => altColorA(a.alt_ft, 90),
-      getWidth: 1.5,
+      getColor: (a) => a.selected ? trailColorA(a, 170) : [125, 155, 190, 50],
+      getWidth: (a) => a.selected ? 2.2 : 1,
       widthUnits: "pixels",
       widthMinPixels: 1,
       visible: visible.planes,
-      updateTriggers: { getSourcePosition: [exag, dataTick], getColor: dataTick },
+      updateTriggers: { getSourcePosition: [exag, dataTick], getColor: selectedKey, getWidth: selectedKey },
       parameters: { depthTest: true },
+    }));
+
+    layers.push(new ScatterplotLayer({
+      id: "selected-plane-halo",
+      data: selectedData,
+      coordinateSystem: CARTESIAN,
+      getPosition: planePosition,
+      getRadius: 20,
+      radiusUnits: "pixels",
+      getFillColor: [245, 203, 98, 34],
+      stroked: true,
+      getLineColor: [245, 203, 98, 235],
+      lineWidthUnits: "pixels",
+      getLineWidth: 2,
+      billboard: true,
+      visible: visible.planes,
+      updateTriggers: { getPosition: [exag, dataTick] },
+      parameters: { depthTest: false, depthMask: false },
     }));
 
     // Live planes — 3D models (default) or flat icon.
@@ -1120,32 +1267,39 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
           data: liveData,
           coordinateSystem: CARTESIAN,
           getIcon: () => PLANE_ICON,
-          getPosition: (a) => [a.east_km, a.north_km, a.alt_ft * FT_TO_KM * exag],
+          getPosition: planePosition,
           getAngle: (a) => -a.track,
-          getColor: (a) => altColorA(a.alt_ft, 255),
-          getSize: 28,
+          getColor: (a) => aircraftColorA(a, 255),
+          getSize: (a) => a.selected ? 34 : 28,
           sizeUnits: "pixels",
           sizeMinPixels: 14,
           billboard: true,
           pickable: true,
+          onClick: selectAircraft,
           visible: visible.planes,
-          updateTriggers: { getPosition: [exag, dataTick], getColor: dataTick, getAngle: dataTick },
+          updateTriggers: { getPosition: [exag, dataTick], getColor: [selectedKey, dataTick], getAngle: dataTick, getSize: selectedKey },
           parameters: { depthTest: true },
         }));
       } else {
-        const air = liveData.filter((a) => a.category !== "A7");
-        const heli = liveData.filter((a) => a.category === "A7");
-        const getPos = (a) => [a.east_km, a.north_km, a.alt_ft * FT_TO_KM * exag];
+        const air = liveData.filter((a) => a.model_kind === "air");
+        const heli = liveData.filter((a) => a.model_kind === "heli");
         const common = {
           coordinateSystem: CARTESIAN,
-          getPosition: getPos,
+          getPosition: planePosition,
           getOrientation: getOrientation,
-          getColor: (a) => altColorA(a.alt_ft, 255),
+          getColor: (a) => aircraftColorA(a, 255),
+          getScale: (a) => a.model_scale,
           sizeScale: modelScale,
           material: true,
           pickable: true,
+          onClick: selectAircraft,
           parameters: { depthTest: true },
-          updateTriggers: { getPosition: [exag, dataTick], getColor: dataTick, getOrientation: dataTick },
+          updateTriggers: {
+            getPosition: [exag, dataTick],
+            getColor: [selectedKey, dataTick],
+            getOrientation: dataTick,
+            getScale: dataTick,
+          },
         };
         layers.push(new SimpleMeshLayer(Object.assign({ id: "planes-model-air", data: air, mesh: AIRPLANE_MESH }, common)));
         layers.push(new SimpleMeshLayer(Object.assign({ id: "planes-model-heli", data: heli, mesh: HELICOPTER_MESH }, common)));
@@ -1153,7 +1307,7 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
     }
 
     instance.setProps({ layers: layers });
-  }, [visible, exag, pointSize, planeStyle, modelScale, liveData, dataTick]);
+  }, [visible, exag, pointSize, planeStyle, modelScale, liveData, selectedKey, onSelectAircraft, dataTick]);
 
   // ------------------------------------------------------------------
   // Profile data (range vs altitude) derived from the accumulator envelope.
@@ -1358,7 +1512,7 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
   // ------------------------------------------------------------------
   const acc = accRef.current;
   const liveCount = liveData.length;
-  const cloudPoints = acc ? acc.cloudCount : 0;
+  const sampleCount = acc ? acc.cloudCount : 0;
   const uniqueAircraft = acc ? acc.icaoSeen.size : 0;
   const maxRangeKm = acc ? acc.maxRangeKm : 0;
   const maxAltFt = acc ? acc.maxAltFt : 0;
@@ -1382,14 +1536,11 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
     <section className="scope-panel coverage-scope">
       <div className="scope-head">
         <div>
-          <span className="eyebrow">Scope</span>
+          <span className="eyebrow">Live Map</span>
           <div className="scope-title-row">
-            <h2>Coverage</h2>
-            <span className="cs-ephemeral-badge" title="Coverage, hull, slice, and profile accumulate in this browser session from the live feed. They are not yet persisted to or replayed from the submission store, so they reset on reload.">
-              session data
-            </span>
+            <h2>Traffic</h2>
           </div>
-          <p className="scope-summary">{positionedCount} positioned / {liveCount} live</p>
+          <p className="scope-summary">{positionedCount} positioned / {liveCount} live · optional coverage layer</p>
         </div>
       </div>
       <div className="cs-deck-wrap">
@@ -1425,14 +1576,14 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
             </div>
             <div className="cs-slider-row">
               <div className="cs-slider-head">
-                <span className="cs-name">Point size</span>
+                <span className="cs-name">Sample dot size</span>
                 <span className="cs-val">{pointSize} px</span>
               </div>
               <input
                 type="range"
-                min="1"
-                max="6"
-                step="0.5"
+                min="0.75"
+                max="4"
+                step="0.25"
                 value={pointSize}
                 onInput={(e) => setPointSize(parseFloat(e.currentTarget.value))}
               />
@@ -1580,7 +1731,7 @@ export default function CoverageScope({ items, trails, receiverSite, receiverSit
         </div>
       </div>
       <div className="cs-footer">
-        <span>{anchorLabel} · {fmtN(cloudPoints)} cloud points · {fmtN(uniqueAircraft)} unique</span>
+        <span>{anchorLabel} · {fmtN(sampleCount)} samples · {fmtN(uniqueAircraft)} unique</span>
         <span>{maxRangeKm > 0 ? `max ${maxRangeKm.toFixed(0)} km` : "building coverage…"}</span>
       </div>
     </section>
